@@ -1,0 +1,1109 @@
+# Core libraries
+import os
+import time
+import logging
+from collections import Counter
+from contextlib import contextmanager
+
+# Data handling
+import numpy as np
+import pandas as pd
+import h5py
+
+# Parallel processing
+from joblib import Parallel, delayed
+
+# Plotting
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib import cm
+from matplotlib import patches as mpatches
+from matplotlib.colors import ListedColormap
+
+# PyTorch
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+# Sklearn - modeling and evaluation
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, f1_score, confusion_matrix, classification_report,
+    ConfusionMatrixDisplay
+)
+from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+
+# Other models
+from xgboost import XGBClassifier
+
+# Stats
+from scipy import stats
+
+# mapping
+import rasterio
+from rasterio.transform import Affine
+
+year = 2018
+
+TRAINING_RATIO = 0.7
+MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available
+SAVE = "yes" # Save model predictions, "yes" or "no"
+SAMPLING = "bypercentage"  # "bypercentage", "bypercentage_count", "bycount"  #sampling strategy 
+WHOLEMAP = False  # If True, process both the labels and the whole map at once, otherwise process on labels
+REPORT = True # If True, save classification report and confusion matrix to CSV
+
+# MLP hyperparameters
+BATCH_SIZE = 1024
+LEARNING_RATE = 0.0005
+NUM_EPOCHS = 200
+PATIENCE = 20  # Early stopping parameter
+
+
+if MODEL in ["XGBOOST", "MLP"]:
+    VAL_TEST_SPLIT_RATIO = 1/2  # Validation to test set split ratio
+else:
+    VAL_TEST_SPLIT_RATIO = 1/10  # Validation to test set split ratio
+
+
+# Log settings
+log_file = "btfm_feature_analysis.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file, mode="w"), logging.StreamHandler()],
+)
+logging.info("Program started.")
+logging.info(f"Using device: {DEVICE}")
+
+# Configuration parameters
+njobs = 12
+chunk_size = 1000
+bands_file_path = f"/maps/mcl66/senegal/representations/{year}_representation_map_10m_utm28n_128bands_clipped.npy"
+#label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped.npy"
+label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_labels.npy"
+field_id_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped.npy"
+updated_fielddata_path = "/maps/mcl66/senegal/supporting/senegal_fields.csv"
+
+
+#Class names for visualization
+if year == 2018:
+    class_names = [
+        "Built-up surface", # 1,
+        "Bare soil", # 2,
+        "Water body", # 3,
+        "Wetland", # 4,
+        "Cropland", # 5,
+        "Shrub land", # 6,
+        "Pasture", # 7,
+        "Natural vegetation" # 8
+    ]
+
+seeds = [1, 2, 3, 4, 5]  # List of seeds for reproducibility
+
+
+for seed in seeds:
+    
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
+    start = time.process_time()
+    # ----------------- Define MLP model -----------------
+    class MLP(nn.Module):
+        def __init__(self, input_size, hidden_sizes, num_classes, dropout_rate=0.4):
+            super(MLP, self).__init__()
+            
+            # First layer with BatchNorm and ReLU
+            self.layer1 = nn.Sequential(
+                nn.Linear(input_size, hidden_sizes[0]),
+                nn.BatchNorm1d(hidden_sizes[0]),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
+            
+            # Second layer with BatchNorm and ReLU
+            self.layer2 = nn.Sequential(
+                nn.Linear(hidden_sizes[0], hidden_sizes[1]),
+                nn.BatchNorm1d(hidden_sizes[1]),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
+            
+            # Third layer with BatchNorm and ReLU
+            self.layer3 = nn.Sequential(
+                nn.Linear(hidden_sizes[1], hidden_sizes[2]),
+                nn.BatchNorm1d(hidden_sizes[2]),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
+            
+            # Output layer
+            self.output = nn.Linear(hidden_sizes[2], num_classes)
+            
+        def forward(self, x):
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.output(x)
+            return x
+
+    # Function to train MLP model
+    def train_mlp(X_train, y_train, X_val, y_val, num_classes, input_size):
+        """Train MLP model and return the trained model"""
+        logging.info(f"Starting MLP training with input size: {input_size}")
+        
+        # Convert to PyTorch tensors
+        X_train_tensor = torch.FloatTensor(X_train)
+        y_train_tensor = torch.LongTensor(y_train - 1)  # Shift labels from 1-18 to 0-17
+
+        X_val_tensor = torch.FloatTensor(X_val)
+        y_val_tensor = torch.LongTensor(y_val - 1)
+        
+        # Create data loaders
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        
+        # Initialize model
+        hidden_sizes = [2048, 1024, 512]  # Three hidden layer sizes
+        model = MLP(input_size, hidden_sizes, num_classes).to(DEVICE)
+        
+        # Define loss function and optimizer
+        criterion = nn.CrossEntropyLoss()#weight=class_weights_tensor)  # Weighted loss
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        
+        # Learning rate scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+        
+        # Train the model
+        best_val_loss = float('inf')
+        early_stop_counter = 0
+        best_model_state = None
+        
+        logging.info(f"MLP model architecture:\n{model}")
+        
+        for epoch in range(NUM_EPOCHS):
+            # Training phase
+            model.train()
+            train_loss = 0.0
+            correct = 0
+            total = 0
+            
+            for batch_x, batch_y in train_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                
+                optimizer.zero_grad()
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += batch_y.size(0)
+                correct += predicted.eq(batch_y).sum().item()
+            
+            train_loss = train_loss / len(train_loader)
+            train_acc = 100.0 * correct / total
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for batch_x, batch_y in val_loader:
+                    batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                    
+                    outputs = model(batch_x)
+                    loss = criterion(outputs, batch_y)
+                    
+                    val_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total += batch_y.size(0)
+                    correct += predicted.eq(batch_y).sum().item()
+            
+            val_loss = val_loss / len(val_loader)
+            val_acc = 100.0 * correct / total
+            
+            # Update learning rate
+            scheduler.step(val_loss)
+            
+            logging.info(f"Epoch {epoch+1}/{NUM_EPOCHS} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict().copy()
+                early_stop_counter = 0
+                logging.info(f"Saving best model with validation loss: {best_val_loss:.4f}")
+            else:
+                early_stop_counter += 1
+            
+            # Early stopping
+            if early_stop_counter >= PATIENCE:
+                logging.info(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        
+        # Load best model
+        model.load_state_dict(best_model_state)
+        return model
+
+    # MLP model prediction function
+    def mlp_predict(model, X):
+        """Make predictions using MLP model"""
+        model.eval()
+        X_tensor = torch.FloatTensor(X).to(DEVICE)
+        
+        # Batch predict for large datasets
+        batch_size = 1024
+        predictions = []
+        
+        with torch.no_grad():
+            for i in range(0, len(X), batch_size):
+                batch_X = X_tensor[i:i+batch_size]
+                outputs = model(batch_X)
+                _, preds = torch.max(outputs, 1)
+                predictions.append((preds+1).cpu().numpy())
+        
+        return np.concatenate(predictions)
+
+
+    # ----------------- Data loading and preprocessing -----------------
+    logging.info(f"Training ratio: {TRAINING_RATIO}")
+    logging.info(f"Validation/Test split ratio: {VAL_TEST_SPLIT_RATIO}")
+    logging.info(f"Selected model: {MODEL}")
+    logging.info("Loading labels and field IDs...")
+
+    labels = (np.load(label_file_path).astype(np.int64)).squeeze()
+    field_ids = np.load(field_id_file_path).squeeze()
+    if MODEL == "XGBOOST":
+        labels -= 1
+    H, W = labels.shape
+    logging.info(f"Data dimensions: {H}x{W}")
+
+
+    # Select valid classes
+    logging.info("Identifying valid classes...")
+    class_counts = Counter(labels.ravel())
+    valid_classes = {cls for cls, count in class_counts.items() if count >= 2}
+    if MODEL == "XGBOOST":
+        valid_classes.discard(-1)
+    else:
+        valid_classes.discard(0)
+    logging.info(f"Valid classes: {sorted(valid_classes)}")
+
+    # ----------------- Train/validation/test set split -----------------
+    logging.info("Splitting data into train/val/test sets...")
+    fielddata_df = pd.read_csv(updated_fielddata_path)
+    fielddata_df = fielddata_df[fielddata_df['Year'] == year]
+    area_summary = fielddata_df.groupby('landcover_code')['Area_ha'].sum().reset_index()
+    count_summary = fielddata_df.groupby('landcover_code').size().reset_index(name='count')
+
+    #area_summary.rename(columns={'area_m2': 'total_area'}, inplace=True)
+
+    if SAMPLING == "bypercentage":
+        print("Sampling by percentage of area...with VAL_TEST_SPLIT_RATIO:", VAL_TEST_SPLIT_RATIO)
+        train_fids = []
+        for _, row in area_summary.iterrows():
+            sn_code = row['landcover_code']
+            total_area = row['Area_ha']
+            target_area = total_area * TRAINING_RATIO
+            rows_sncode = fielddata_df[fielddata_df['landcover_code'] == sn_code].sort_values(by='Area_ha')
+            selected_fids = []
+            selected_area_sum = 0
+            for _, r2 in rows_sncode.iterrows():
+                if selected_area_sum < target_area:
+                    selected_fids.append(int(r2['Id']))
+                    selected_area_sum += r2['Area_ha']
+                else:
+                    break
+            train_fids.extend(selected_fids)
+
+        train_fids = list(set(train_fids))
+        logging.info(f"Number of selected train field IDs: {len(train_fids)}")
+
+        # Split remaining field IDs into validation and test sets
+        all_fields = fielddata_df['Id'].unique().astype(int)
+        set_train = set(train_fids)
+        set_all = set(all_fields)
+        remaining = list(set_all - set_train)
+        remaining = np.array(remaining)
+        np.random.shuffle(remaining)
+        val_count = int(len(remaining) * VAL_TEST_SPLIT_RATIO)
+        val_fids = remaining[:val_count]
+        test_fids = remaining[val_count:]
+        train_fids = np.array(train_fids)
+    
+    if SAMPLING == "bypercentage_count":
+        fewshot = ""
+        # Collect training set field IDs
+        train_fids = []
+        for _, row in count_summary.iterrows():
+            sn_code = row['landcover_code']
+            total_count = row['count']
+            target_count = total_count * TRAINING_RATIO
+            rows_sncode = fielddata_df[fielddata_df['landcover_code'] == sn_code]
+
+            selected_fids = []
+            #selected_area_sum = 0
+            count_sum = 0
+            for _, r2 in rows_sncode.iterrows():
+                if count_sum < target_count:
+                    selected_fids.append(int(r2['Id']))
+                    count_sum += 1
+                else:
+                    break
+            train_fids.extend(selected_fids)
+
+        train_fids = list(set(train_fids))
+        logging.info(f"Number of selected train field IDs: {len(train_fids)}")
+
+        # Split remaining field IDs into validation and test sets
+        all_fields = fielddata_df['Id'].unique().astype(int)
+        set_train = set(train_fids)
+        set_all = set(all_fields)
+        remaining = list(set_all - set_train)
+        remaining = np.array(remaining)
+        np.random.shuffle(remaining)
+        val_count = int(len(remaining) * VAL_TEST_SPLIT_RATIO)
+        val_fids = remaining[:val_count]
+        test_fids = remaining[val_count:]
+        train_fids = np.array(train_fids)
+    
+    if SAMPLING == "bycount":
+        # Initialize field ID lists
+        fewshot = "_"
+        train_fids = []
+        val_fids = []
+        test_fids = []
+        #snar_codes = fielddata_df['landcover_code'].unique()
+        snar_codes = fielddata_df['landcover_code'].unique()
+        print(f"Unique landcover codes: {snar_codes}")
+
+        for sn_code in snar_codes:
+            rows_sncode = fielddata_df[fielddata_df['landcover_code'] == sn_code]
+            fids = rows_sncode['Id'].unique()
+            fids = np.array(fids)
+            np.random.shuffle(fids)
+
+            NUM_FIELDS = 5
+            if len(fids) >= NUM_FIELDS*2:
+                # Enough fields: take 10 for train, 10 for val, rest for test
+                test_fids.extend(fids[:NUM_FIELDS])
+                val_fids.extend(fids[NUM_FIELDS:NUM_FIELDS*2])
+                train_fids.extend(fids[NUM_FIELDS*2:])
+            else:
+                total = len(fids)
+                n_val = min(5, total // 2)
+                n_test = min(5, total - n_val)
+                n_train = max(0, total - n_val - n_test)
+
+                val_fids.extend(fids[:n_val])
+                test_fids.extend(fids[n_val:n_val+n_test])
+                train_fids.extend(fids[n_val+n_test:])
+
+        train_fids = np.array(train_fids)
+        val_fids = np.array(val_fids)
+        test_fids = np.array(test_fids)
+        
+        for name, fids in [("Train", train_fids), ("Val", val_fids), ("Test", test_fids)]:
+            subset = fielddata_df[fielddata_df["Id"].isin(fids)]
+            print(f"\n{name} set class distribution:")
+            print(subset["landcover_code"].value_counts())
+
+    
+    logging.info(f"Train fields: {len(train_fids)}, Val fields: {len(val_fids)}, Test fields: {len(test_fids)}")
+
+    # ----------------- Create training/validation/testing split map -----------------
+    logging.info("Creating train/val/test split map for visualization...")
+    # Now we need to create the train/test/val mask using field_ids
+    # Vectorized mask creation
+    train_test_mask = np.zeros_like(field_ids, dtype=np.int8)
+    train_test_mask[np.isin(field_ids, train_fids)] = 1
+    train_test_mask[np.isin(field_ids, val_fids)] = 2
+    train_test_mask[np.isin(field_ids, test_fids)] = 3
+
+    if MODEL != "XGBOOST":
+        valid_label_mask = (labels > 0)
+    elif MODEL == "XGBOOST":
+        valid_label_mask = (labels >= 0)
+
+    # Report class distribution by pixel after split
+    y = labels  # Don't prefilter
+
+    for split_id, name in [(1, "Train"), (2, "Val"), (3, "Test")]:
+        mask = (train_test_mask == split_id)
+        y_split = y[mask]
+        print(f"{name} pixel class distribution:")
+        print(pd.Series(y_split).value_counts())
+
+
+    # ----------------- Chunk processing -----------------
+    def process_chunk(h_start, h_end, w_start, w_end, file_path):
+        logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
+        
+        # Load the chunk (new shape: H, W, bands)
+        tile_chunk = (np.load(file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]  # shape: (h, w, b)
+
+        # Reshape to (h * w, b) for ML model
+        h, w, b = tile_chunk.shape
+        s2_band_chunk = tile_chunk.reshape(-1, b)
+
+        # Load labels and field_ids
+        y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
+        fieldid_chunk = field_ids[h_start:h_end, w_start:w_end].ravel()
+
+        # Filter valid pixels
+        valid_mask = np.isin(y_chunk, list(valid_classes))
+        X_chunk = s2_band_chunk[valid_mask]
+        y_chunk = y_chunk[valid_mask]
+        fieldid_chunk = fieldid_chunk[valid_mask]
+
+        # Train/val/test split
+        train_mask = np.isin(fieldid_chunk, train_fids)
+        val_mask = np.isin(fieldid_chunk, val_fids)
+        test_mask = np.isin(fieldid_chunk, test_fids)
+
+        return (X_chunk[train_mask], y_chunk[train_mask],
+                X_chunk[val_mask], y_chunk[val_mask],
+                X_chunk[test_mask], y_chunk[test_mask])
+
+    # Parallel processing
+    chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+            for h in range(0, H, chunk_size)
+            for w in range(0, W, chunk_size)]
+    logging.info(f"Total chunks: {len(chunks)}")
+
+    results = Parallel(n_jobs=njobs)(
+        delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
+        for h_start, h_end, w_start, w_end in chunks
+    )
+
+    def safe_vstack(arrays, empty_shape=None):
+        filtered = [arr for arr in arrays if arr.size > 0]
+        if filtered:
+            return np.vstack(filtered)
+        else:
+            if empty_shape is not None:
+                return np.empty(empty_shape)
+            else:
+                return np.empty((0,))
+    
+    def safe_hstack(arrays, empty_shape=None):
+        filtered = [arr for arr in arrays if arr.size > 0]
+        if filtered:
+            return np.hstack(filtered)
+        else:
+            if empty_shape is not None:
+                return np.empty(empty_shape, dtype=int)
+            else:
+                return np.empty((0,), dtype=int)
+
+    feature_dim = None
+    
+    for res in results:
+        if res[0].size > 0:
+            feature_dim = res[0].shape[1]  # number of columns = feature dim
+            break
+
+    if feature_dim is None:
+        raise ValueError("No training data found to infer feature dimension!")
+    logging.info(f"Feature dimension: {feature_dim}")
+
+    # Combine results
+    # X_train = np.vstack([res[0] for res in results if res[0].size > 0])
+    # y_train = np.hstack([res[1] for res in results if res[1].size > 0])
+    # X_val = np.vstack([res[2] for res in results if res[2].size > 0])
+    # y_val = np.hstack([res[3] for res in results if res[3].size > 0])
+    # X_test = np.vstack([res[4] for res in results if res[4].size > 0])
+    # y_test = np.hstack([res[5] for res in results if res[5].size > 0])
+
+        
+    # feature_dim inferred previously
+    X_train = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
+    y_train = safe_hstack([res[1] for res in results], empty_shape=(0,))
+
+    X_val = safe_vstack([res[2] for res in results], empty_shape=(0, feature_dim))
+    y_val = safe_hstack([res[3] for res in results], empty_shape=(0,))
+
+    X_test = safe_vstack([res[4] for res in results], empty_shape=(0, feature_dim))
+    y_test = safe_hstack([res[5] for res in results], empty_shape=(0,))
+
+
+    if MODEL != "XGBOOST":
+        # Remove class 0 (background) from training data
+        logging.info("Removing class 0 (background) from training data...")
+        indices_to_remove = np.where(y_train == 0)[0]
+        y_train = np.delete(y_train, indices_to_remove, axis=0)
+        X_train = np.delete(X_train, indices_to_remove, axis=0)
+
+    logging.info(f"Unique y training: {np.unique(y_train)}")
+    logging.info(f"Unique y val: {np.unique(y_val)}")
+    logging.info(f"Unique y test: {np.unique(y_test)}")
+
+    logging.info(f"Data split summary:")
+    logging.info(f"  Train set: {X_train.shape[0]} samples")
+    logging.info(f"  Validation set: {X_val.shape[0]} samples")
+    logging.info(f"  Test set: {X_test.shape[0]} samples")
+
+    # Print data shapes
+    logging.info(f"X_train shape: {X_train.shape}")
+    input_size = X_train.shape[1]
+    logging.info(f"Input feature dimension: {input_size}")
+
+    # ----------------- Model training -----------------
+    logging.info(f"\nTraining {MODEL}...")
+
+    if MODEL == "LogisticRegression":
+        model = LogisticRegression(
+            multi_class='multinomial',
+            solver='lbfgs',
+            C=1e4,
+            max_iter=100000,
+            n_jobs=njobs,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+    elif MODEL == "RandomForest":
+        model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            n_jobs=njobs,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+    elif MODEL == "XGBOOST":
+                # Compute balanced sample weights
+                # sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+
+                # Define the model
+                model = XGBClassifier(
+                    n_estimators=400,
+                    max_depth=6,
+                    learning_rate=0.1,
+                    gamma=0,
+                    min_child_weight=1,
+                    subsample=0.8,
+                    colsample_bytree=1.0,
+                    reg_alpha=0,
+                    reg_lambda=1,
+                    objective='multi:softprob',
+                    num_class=7,  # Update this if the number of classes changes
+                    n_jobs= 2, #njobs,  # Assumes you've defined `njobs` elsewhere
+                    random_state=42
+                )
+                #Fit with sample weights
+                model.fit(X_train, y_train)
+                
+    elif MODEL == "MLP":
+        # Get number of classes
+        num_classes = max(valid_classes) 
+        logging.info(f"Number of classes: {num_classes}")
+        
+        # Train MLP model
+        mlp_model = train_mlp(X_train, y_train, X_val, y_val, num_classes, input_size)
+        
+        # Create a wrapper class for consistency with other models
+        class MLPWrapper:
+            def __init__(self, model):
+                self.model = model
+                
+            def predict(self, X):
+                return mlp_predict(self.model, X)
+        
+        model = MLPWrapper(mlp_model)
+        
+    else:
+        raise ValueError(f"Unknown model type: {MODEL}. Use 'LogisticRegression', 'RandomForest', or 'MLP'")
+
+    # ----------------- Evaluation -----------------
+    logging.info("Evaluating model on test set...")
+    y_pred = model.predict(X_test)
+    logging.info("Classification Report (Test Set):\n" + classification_report(y_test, y_pred, digits=4))
+
+    def save_classification_report(y_true, y_pred, seed, cpu_time, filename="classification_report.csv"):
+        # Get classification report as a dict and convert to DataFrame (multi-row format)
+        report_dict = classification_report(y_true, y_pred, output_dict=True)
+        report_df = pd.DataFrame(report_dict).transpose().reset_index().rename(columns={"index": "label"})
+
+        # Add the seed and cpu_time columns to every row
+        report_df.insert(0, "cpu_time", cpu_time)
+        report_df.insert(0, "seed", seed)
+
+        # If file exists, append the new block; else create new file
+        if os.path.exists(filename):
+            existing_df = pd.read_csv(filename)
+            combined_df = pd.concat([existing_df, report_df], ignore_index=True)
+        else:
+            combined_df = report_df
+
+        # Save the full DataFrame back to CSV
+        if SAVE == "yes":
+            combined_df.to_csv(filename, index=False, float_format='%.4f')
+
+    end = time.process_time()
+    logging.info(f"Processing time: {end - start} seconds for seed {seed}")
+    cpu_time = end - start
+    
+    
+    def save_confusion_matrix(y_true, y_pred, class_names):
+        """Save confusion matrix to CSV."""
+        logging.info("Saving confusion matrix to CSV...")
+        # Compute confusion matrix
+        cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
+
+        # Convert to DataFrame for readability
+        df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+
+        # Save to CSV
+        df_cm.to_csv(f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_classification_confmatrix_{MODEL.lower()}_landcover.csv", index=True)
+    
+    
+    if REPORT == True:
+        class_report_filename = f'/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_classification_report_{MODEL.lower()}_landcover.csv'
+        save_confusion_matrix(y_test, y_pred, class_names)
+        save_classification_report(y_test, y_pred, seed, cpu_time, class_report_filename)
+    
+
+    # ----------------- Classification Map Generation -----------------
+    logging.info("\nGenerating classification maps...")
+
+    # Generate a color palette (using tab20 and extending if needed)
+    def get_color_palette(n_classes):
+        """Generate a color palette for classification maps."""
+        # Start with tab20 which has 20 distinct colors
+        base_cmap = plt.cm.get_cmap('tab20')
+        colors = [base_cmap(i) for i in range(20)]
+        
+        # If we need more colors, add from other colormaps
+        if n_classes > 20:
+            extra_cmap = plt.cm.get_cmap('tab20b')
+            colors.extend([extra_cmap(i) for i in range(n_classes - 20)])
+        
+        # Return only the number of colors we need
+        return colors[:n_classes]
+
+    # Setup for visualization
+    # Add 1 to max class for background (0)
+    max_class = max(valid_classes) 
+    n_classes = len(valid_classes)
+    logging.info(f"Creating color mapping for {n_classes} classes (1-{max_class})")
+
+    # Generate color palette
+    colors = get_color_palette(max_class + 1)  # +1 for background class (0)
+    # Set background (0) to white
+    colors[0] = (1, 1, 1, 1)  # White for background
+
+    # Create colormap
+    cmap = ListedColormap(colors)
+
+    # Define a plotting function for consistent formatting
+    def plot_classification_map(data, title, cmap, class_names, save_path, figsize=(12, 10)):
+        """Create a nicely formatted classification map without colorbar."""
+        plt.figure(figsize=figsize, dpi=300)
+        
+        # Set up the plot with publication quality
+        plt.rcParams.update({
+            'font.family': 'sans-serif',  # Use a generic font family available everywhere
+            'font.size': 12,
+            'axes.linewidth': 1.5
+        })
+        
+        # Plot the data
+        im = plt.imshow(data, cmap=cmap, interpolation='nearest')
+                
+        # Create a legend with class names
+        if class_names:
+            # Get the number of unique classes in the data
+            unique_classes = sorted(np.unique(data))
+            # Filter out 0 if it's background
+            if 0 in unique_classes and len(unique_classes) > 1:
+                unique_classes = [c for c in unique_classes if c > 0]
+            
+            # Create legend patches for each class
+            legend_patches = []
+            for cls in unique_classes:
+                if cls == 0:
+                    continue  # Skip background
+                if cls <= len(class_names):
+                    # Use class color from colormap
+                    color = cmap(cls / max(unique_classes))
+                    label = class_names[cls-1] if cls-1 < len(class_names) else f"Class {cls}"
+                    legend_patches.append(mpatches.Patch(color=color, label=label))
+            
+            # Add legend outside the plot with larger text and make it more prominent
+            plt.legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), 
+                    loc='upper left', fontsize=14, frameon=True, fancybox=True, 
+                    shadow=True, title="Classes", title_fontsize=15)
+        
+        # Add title and style adjustments
+        plt.title(title, fontsize=16, fontweight='bold', pad=20)
+        plt.tight_layout()
+        
+        # Save the figure
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"Saved classification map to {save_path}")
+
+    # 1. Original Ground Truth Map
+    # logging.info("Generating ground truth classification map...")
+    # plot_classification_map(
+    #     labels, 
+    #     f"Ground Truth Land Cover Classification", 
+    #     cmap, 
+    #     class_names, 
+    #     f"toy_ground_truth_map.png"
+    # )
+
+
+    # 3. Training/Testing Split Map
+    # logging.info("Generating training/testing/validation split map...")
+    # train_test_cmap = ListedColormap(['white', 'blue', 'green', 'red'])  # White for background, blue for training, green for validation, red for testing
+    # train_test_names = ["Background", "Training Set", "Validation Set", "Testing Set"]
+
+    # plot_classification_map(
+    #     train_test_mask, 
+    #     f"Training, Validation and Testing Sample Distribution", 
+    #     train_test_cmap, 
+    #     train_test_names, 
+    #     f"toy_train_test_split_map.png"
+    # )
+
+    # ----------------- Generating Prediction Map (Optimized) -----------------
+    logging.info("Generating prediction map - this may take some time...")
+
+    # Create prediction map
+    pred_map = np.zeros_like(labels)
+    
+    if WHOLEMAP == True:
+            pred_map_whole = np.zeros_like(labels)
+
+    # Optimized batch prediction for a whole chunk
+    def batch_predict_chunk(h_start, h_end, w_start, w_end, wholemap=False):
+        """Process and predict a chunk of the image more efficiently."""
+        # Create mask for valid classes in this chunk
+        chunk_labels = labels[h_start:h_end, w_start:w_end]
+        chunk_fieldids = field_ids[h_start:h_end, w_start:w_end]
+        
+        # Create empty prediction array for this chunk
+        chunk_pred = np.zeros_like(chunk_labels)
+        
+        if wholemap == True:
+            predict_mask = np.ones_like(chunk_labels, dtype=bool)
+
+        elif not wholemap:
+            # Identify valid pixels that need prediction (non-training pixels with valid classes)
+            valid_mask = np.isin(chunk_labels, list(valid_classes))
+            # Get mask for test/val pixels (those not in training)
+            non_train_mask = ~np.isin(chunk_fieldids, train_fids)
+            # Combine masks to get pixels that need prediction
+            predict_mask = valid_mask & non_train_mask
+            # Copy training pixels directly (they should match ground truth)
+            train_mask = valid_mask & ~non_train_mask
+            chunk_pred[train_mask] = chunk_labels[train_mask]   
+        
+        # If there are no pixels to predict, return early
+        if not np.any(predict_mask):
+            return h_start, h_end, w_start, w_end, chunk_pred
+        
+        # Get coordinates of pixels that need prediction
+        h_indices, w_indices = np.where(predict_mask)
+        
+        # Load data for feature extraction (only once per chunk)
+        s2_data = (np.load(bands_file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]
+        
+        # Batch size for processing within chunk
+        batch_size = 1000
+        for i in range(0, len(h_indices), batch_size):
+            batch_h = h_indices[i:i+batch_size]
+            batch_w = w_indices[i:i+batch_size]
+            
+            # Extract features for this batch of pixels
+            batch_features = []
+            for j in range(len(batch_h)):
+                h_idx, w_idx = batch_h[j], batch_w[j]
+                
+                # S2 feature extraction
+                s2_pixel = s2_data[h_idx, w_idx, :]
+                #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
+                #s2_features = s2_norm.reshape(-1)
+                features = s2_pixel
+                batch_features.append(features)
+            
+            # Convert to numpy array
+            batch_features = np.array(batch_features)
+            
+            # Batch prediction
+            batch_preds = model.predict(batch_features)
+            
+            # Place predictions into chunk
+            for j in range(len(batch_h)):
+                h_idx, w_idx = batch_h[j], batch_w[j]
+                chunk_pred[h_idx, w_idx] = batch_preds[j]
+        
+        return h_start, h_end, w_start, w_end, chunk_pred
+
+    # Define chunks for parallel processing of prediction map
+    pred_chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+                for h in range(0, H, chunk_size)
+                for w in range(0, W, chunk_size)]
+
+    # Process prediction map in parallel
+    logging.info("Processing prediction map in parallel (optimized)...")
+    start_time = time.time()
+
+    pred_results = Parallel(n_jobs=njobs)(
+        delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end, False)
+        for h_start, h_end, w_start, w_end in pred_chunks
+    )
+
+    # Combine prediction results
+    for h_start, h_end, w_start, w_end, chunk_pred in pred_results:
+        pred_map[h_start:h_end, w_start:w_end] = chunk_pred
+
+    end_time = time.time()
+    logging.info(f"Prediction map generation completed in {end_time - start_time:.2f} seconds")
+    
+    if WHOLEMAP == True:
+        pred_results_whole = Parallel(n_jobs=njobs)(
+            delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end, True)
+            for h_start, h_end, w_start, w_end in pred_chunks
+        )
+        
+            # Combine prediction results
+        for h_start, h_end, w_start, w_end, chunk_pred in pred_results_whole:
+            pred_map_whole[h_start:h_end, w_start:w_end] = chunk_pred
+
+    # 2. Model Prediction Map
+    logging.info("Saving model prediction classification map...")
+    model_name = MODEL
+    if SAVE == "yes":
+        plot_classification_map(
+            pred_map, 
+            f"{model_name} Classification Predictions", 
+            cmap, 
+            class_names, 
+            f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_{model_name.lower()}_{seed}.png"
+        )
+        # Save the prediction map as a numpy file
+        np.save(f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_{model_name.lower()}_{seed}.npy", pred_map)
+
+
+    def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
+        # Load npy data, assuming shape (H, W) or (H, W, C)
+        data = npy
+        
+        if data.dtype == np.int64:
+            # Convert int64 to uint8 if necessary
+            print("Converting int64 data to uint8...")
+            data = data.astype(np.uint8)    
+            
+        if data.ndim == 2:
+            H, W = data.shape
+            C = 1
+        else:
+            H, W, C = data.shape
+
+        # Downsample if needed
+        if downsample_rate > 1:
+            new_H = H // downsample_rate
+            new_W = W // downsample_rate
+            downsampled_data = np.zeros((new_H, new_W, C), dtype=data.dtype)
+
+            for i in range(new_H):
+                for j in range(new_W):
+                    i_start = i * downsample_rate
+                    i_end = min((i + 1) * downsample_rate, H)
+                    j_start = j * downsample_rate
+                    j_end = min((j + 1) * downsample_rate, W)
+                    block = data[i_start:i_end, j_start:j_end, :] if C > 1 else data[i_start:i_end, j_start:j_end]
+                    downsampled_data[i, j] = np.mean(block, axis=(0, 1)).astype(data.dtype)
+
+            data = downsampled_data
+            H, W = new_H, new_W
+
+        # Reference geospatial info from a valid GeoTIFF
+        with rasterio.open(ref_tiff_path) as ref:
+            transform = ref.transform
+            crs = ref.crs
+            ref_meta = ref.meta.copy()
+
+            if downsample_rate > 1:
+                transform = Affine(
+                    transform.a * downsample_rate, transform.b, transform.c,
+                    transform.d, transform.e * downsample_rate, transform.f
+                )
+
+        # Update metadata
+        new_meta = ref_meta.copy()
+        new_meta.update({
+            'driver': 'GTiff',
+            'height': H,
+            'width': W,
+            'count': C,
+            'dtype': data.dtype,
+            'transform': transform,
+            'crs': crs
+        })
+
+        # Write TIFF
+        with rasterio.open(output_path, 'w', **new_meta) as dst:
+            if C == 1:
+                dst.write(data, 1)
+            else:
+                for i in range(C):
+                    dst.write(data[:, :, i], i + 1)
+
+        print(f"✅ Saved GeoTIFF to {output_path}")
+        print(f"Resolution: {10 * downsample_rate} m")
+
+
+    if WHOLEMAP == True:
+        if SAVE == "yes":
+            print("Saving whole map prediction classification map...")
+            plot_classification_map(
+                pred_map_whole, 
+                f"{model_name} Classification Predictions", 
+                cmap, 
+                class_names, 
+                f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{model_name.lower()}_{seed}.png"
+            )
+            # Save the prediction map as a numpy file
+            np.save(f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{model_name.lower()}_{seed}.npy", pred_map_whole)
+            
+            # Convert the prediction map to TIFF format
+            output_path = f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{model_name.lower()}_{seed}.tiff"
+            ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
+            convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
+
+
+    # Generate a composite map that shows the differences between prediction and ground truth
+    logging.info("Generating prediction difference map...")
+    diff_map = np.zeros_like(labels)
+
+    # # Calculate difference map
+    # for h in range(H):
+    #     for w in range(W):
+    #         if labels[h, w] in valid_classes and pred_map[h, w] > 0:
+    #             if field_ids[h, w] in train_fids:
+    #                 # Training pixels - should match ground truth (but mark differently)
+    #                 diff_map[h, w] = 1  # Training pixel
+    #             else:
+    #                 # Test/Val pixels - check if prediction matches ground truth
+    #                 diff_map[h, w] = 2 if pred_map[h, w] == labels[h, w] else 3  # 2=correct, 3=incorrect
+
+    # diff_cmap = ListedColormap(['white', 'blue', 'lightgray', 'red'])  # White=background, blue=training, gray=correct, red=incorrect
+    # diff_names = ["Background", "Training", "Correct Prediction", "Incorrect Prediction"]
+
+    # plot_classification_map(
+    #     diff_map, 
+    #     f"{model_name} Prediction Accuracy", 
+    #     diff_cmap, 
+    #     diff_names, 
+    #     f"btfm_prediction_difference_map_{model_name.lower()}.png"
+    # )
+    # np.save(f"btfm_prediction_difference_map_{model_name.lower()}.npy", diff_map)
+
+
+    # Calculate and log the accuracy statistics
+    test_pixels = 0
+    test_correct = 0
+    val_pixels = 0
+    val_correct = 0
+
+    for h in range(H):
+        for w in range(W):
+            if labels[h, w] in valid_classes:
+                fid = field_ids[h, w]
+                if fid in test_fids:
+                    test_pixels += 1
+                    if pred_map[h, w] == labels[h, w]:
+                        test_correct += 1
+                elif fid in val_fids:
+                    val_pixels += 1
+                    if pred_map[h, w] == labels[h, w]:
+                        val_correct += 1
+
+    test_accuracy = test_correct / test_pixels * 100 if test_pixels > 0 else 0
+    val_accuracy = val_correct / val_pixels * 100 if val_pixels > 0 else 0
+
+    logging.info(f"\nTest set prediction statistics:")
+    logging.info(f"Test pixels: {test_pixels}, Correct: {test_correct}, Accuracy: {test_accuracy:.2f}%")
+    logging.info(f"Validation pixels: {val_pixels}, Correct: {val_correct}, Accuracy: {val_accuracy:.2f}%")
+
+    # Per-class accuracy statistics
+    class_accuracies = {}
+    for cls in sorted(valid_classes):
+        # Count test pixels for this class
+        cls_pixels = 0
+        cls_correct = 0
+        
+        for h in range(H):
+            for w in range(W):
+                if labels[h, w] == cls and field_ids[h, w] in test_fids:
+                    cls_pixels += 1
+                    if pred_map[h, w] == cls:
+                        cls_correct += 1
+        
+        if cls_pixels > 0:
+            cls_accuracy = cls_correct / cls_pixels * 100
+            class_accuracies[cls] = cls_accuracy
+            class_name = class_names[cls-1] if cls-1 < len(class_names) else f"Class {cls}"
+            logging.info(f"Class {cls} ({class_name}) accuracy: {cls_accuracy:.2f}% ({cls_correct}/{cls_pixels} pixels)")
+
+    # Generate a class accuracy bar plot
+    plt.figure(figsize=(14, 8))
+
+    # Set font to a common font available on all systems
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.size': 12
+    })
+
+    classes = list(class_accuracies.keys())
+    accuracies = list(class_accuracies.values())
+    class_labels = [class_names[cls-1] if cls-1 < len(class_names) else f"Class {cls}" for cls in classes]
+
+    # Sort by accuracy for better visualization
+    sorted_indices = np.argsort(accuracies)
+    sorted_classes = [classes[i] for i in sorted_indices]
+    sorted_accuracies = [accuracies[i] for i in sorted_indices]
+    sorted_labels = [class_labels[i] for i in sorted_indices]
+
+    # Plot horizontal bar chart
+    bars = plt.barh(range(len(sorted_classes)), sorted_accuracies, color=[cmap(cls/max(classes)) for cls in sorted_classes])
+    plt.yticks(range(len(sorted_classes)), sorted_labels, fontsize=12)
+    plt.xlabel('Accuracy (%)', fontsize=14)
+    plt.title(f'{model_name} - Per-Class Accuracy', fontsize=16)
+    plt.axvline(test_accuracy, color='red', linestyle='--', label=f'Overall Accuracy: {test_accuracy:.1f}%')
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    if SAVE == "yes":
+        # Save the plot
+        plt.savefig(f'/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_class_accuracy_{seed}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logging.info("\nAnalysis completed!")
+    print("Process finished. Logs saved to:", log_file)
+    print("Classification maps saved as PNG files.")
+
+    # If using MLP model, save the model
+    # if MODEL == "MLP":
+    #     model_save_path = f'mlp_model.pt'
+    #     torch.save(mlp_model.state_dict(), model_save_path)
+    #     logging.info(f"MLP model saved to {model_save_path}")
