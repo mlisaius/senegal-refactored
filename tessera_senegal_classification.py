@@ -53,8 +53,8 @@ year = 2018
 
 TRAINING_RATIO = 0.7
 MODELS = ["RandomForest"]  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
-NUM_SEEDS = 1  # Number of seeds for reproducibility
-CLASSIFICATION = "maincrop"  # Options: "landcover", "maincrop"
+NUM_SEEDS = 20  # Number of seeds for reproducibility
+CLASSIFICATION = "landcover"  # Options: "landcover", "maincrop"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available
 SAVE = "yes" # Save model prediction map, "yes" or "no"
 SAMPLING = "bypercentage_count"  # "bypercentage", "bypercentage_count", "bycount"  #sampling strategy 
@@ -117,7 +117,10 @@ elif CLASSIFICATION == "maincrop":
         #6: 0   # Pasture
     }
 
-    agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_15agg.npy')
+    if year == 2021:
+        agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_remapped_15agg.npy')
+    else:
+        agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_15agg.npy')
     agg_pred_map_mask = np.vectorize(lambda x: remapping.get(x, 0))(agg_pred_map)   
     
     mapping_code = "maincrop_code"
@@ -739,7 +742,7 @@ for dummy in [1]: #[2018, 2019]:
                         
             elif MODEL == "MLP":
                 # Get number of classes
-                num_classes = max(valid_classes) 
+                num_classes = max(valid_classes+1) 
                 logging.info(f"Number of classes: {num_classes}")
                 
                 

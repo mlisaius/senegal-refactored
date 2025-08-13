@@ -167,23 +167,328 @@ seeds = list(range(1, RUNS+1))
 
 trained_models = []
 
-for seed in seeds: #[2018, 2019]:
-    print(f"Processing year: {year}")
-    for model in ["MLP", "RandomForest"]: # , "XGBOOST"]:
-        MODEL = model
-        
-        if MODEL in ["XGBOOST", "MLP"]:
-            VAL_TEST_SPLIT_RATIO = 1/4  # Validation to test set split ratio
-        else:
-            VAL_TEST_SPLIT_RATIO = 1/20  # Validation to test set split ratio
-
-        if REMAP2021:
+for seed in seeds: 
+    
+    VAL_TEST_SPLIT_RATIO = 1/4  # Validation to test set split ratio
+    
+    if REMAP2021:
             if year == 2021:
                 REDUCE_LABELS = True  # For 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
                 remapped_labels = "_remapped"
             else:
                 REDUCE_LABELS = False
                 remapped_labels = ""
+    # ----------------- Data loading and preprocessing -----------------
+    logging.info(f"Training ratio: {TRAINING_RATIO}")
+    logging.info(f"Validation/Test split ratio: {VAL_TEST_SPLIT_RATIO}")
+    #logging.info(f"Selected model: {MODEL}")
+    logging.info("Loading labels and field IDs...")
+
+    labels = (np.load(label_file_path).astype(np.int64)).squeeze()
+    
+    field_ids = np.load(field_id_file_path).squeeze()
+    
+    if REDUCE_LABELS:
+        # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
+        logging.info("Reducing labels...")
+        # remap labels to 0 for pasture (7) and natural vegetation (8)
+        mask = np.isin(labels, [7, 8])
+        labels[mask] = 0  # Set pasture and natural vegetation to 0
+        field_ids[mask] = 0  # Set corresponding field IDs to 0
+                
+    #if MODEL == "XGBOOST":
+    labels -= 1
+    
+    H, W = labels.shape
+    logging.info(f"Data dimensions: {H}x{W}")
+
+
+    # Select valid classes
+    logging.info("Identifying valid classes...")
+    class_counts = Counter(labels.ravel())
+    valid_classes = {cls for cls, count in class_counts.items() if count >= 2}  
+    #if MODEL == "XGBOOST":
+    valid_classes.discard(-1)
+    #else:
+    #    valid_classes.discard(0)
+    logging.info(f"Valid classes: {sorted(valid_classes)}")
+
+    # ----------------- Train/validation/test set split -----------------
+    logging.info("Splitting data into train/val/test sets...")
+    fielddata_df = pd.read_csv(updated_fielddata_path)
+    fielddata_df = fielddata_df[fielddata_df['Year'] == year]
+    
+    # Shuffle the DataFrame in-place before sampling
+    fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+    
+    area_summary = fielddata_df.groupby(classcode)['Area_ha'].sum().reset_index()
+    count_summary = fielddata_df.groupby(classcode).size().reset_index(name='count')
+
+    #area_summary.rename(columns={'area_m2': 'total_area'}, inplace=True)
+
+    if SAMPLING == "bypercentage":
+        print("Sampling by percentage of area...with VAL_TEST_SPLIT_RATIO:", VAL_TEST_SPLIT_RATIO)
+        train_fids = []
+        val_fids = []
+        test_fids = []
+
+        for _, row in area_summary.iterrows():
+            sn_code = row[classcode]
+            total_area = row['Area_ha']
+            target_train_area = total_area * TRAINING_RATIO
+
+            # Get and shuffle all fields for this class
+            rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
+            rows_sncode = rows_sncode.sort_values(by='Area_ha').reset_index(drop=True)  # sorted by area (smallest to largest)
+
+            # --- TRAINING SELECTION BY AREA ---
+            selected_fids = []
+            selected_area_sum = 0.0
+            for _, r2 in rows_sncode.iterrows():
+                if selected_area_sum < target_train_area:
+                    selected_fids.append(int(r2['Id']))
+                    selected_area_sum += r2['Area_ha']
+                else:
+                    break
+
+            train_fids.extend(selected_fids)
+
+            # --- REMAINING FIELDS FOR VAL/TEST ---
+            remaining_rows = rows_sncode[~rows_sncode['Id'].isin(selected_fids)].copy()
+            remaining_rows = remaining_rows.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle remaining
+
+            val_count = max(1, int(len(remaining_rows) * VAL_TEST_SPLIT_RATIO))
+            val_rows = remaining_rows.iloc[:val_count]
+            test_rows = remaining_rows.iloc[val_count:]
+
+            val_fids.extend(val_rows['Id'].astype(int).tolist())
+            test_fids.extend(test_rows['Id'].astype(int).tolist())
+
+        # Remove potential duplicates just in case
+        train_fids = np.array(list(set(train_fids)))
+        val_fids = np.array(list(set(val_fids)))
+        test_fids = np.array(list(set(test_fids)))
+
+        logging.info(f"Number of train FIDs: {len(train_fids)}")
+        logging.info(f"Number of val FIDs: {len(val_fids)}")
+        logging.info(f"Number of test FIDs: {len(test_fids)}")
+
+    
+    if SAMPLING == "bypercentage_count":
+        fewshot = ""
+        # Collect training set field IDs
+        train_fids = []
+        val_fids = []
+        test_fids = []
+
+        for _, row in count_summary.iterrows():
+            sn_code = row[classcode]
+            total_count = row['count']
+            target_train_count = int(total_count * TRAINING_RATIO)
+
+            # Filter rows for this class and shuffle them
+            rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
+            rows_sncode = rows_sncode.sample(frac=1, random_state=42).reset_index(drop=True)  # Shuffle
+
+            # Split into train, val, test
+            selected_train = rows_sncode.iloc[:target_train_count]
+            remaining = rows_sncode.iloc[target_train_count:]
+
+            # Compute validation count
+            val_count = max(1, int(len(remaining) * VAL_TEST_SPLIT_RATIO))
+
+            selected_val = remaining.iloc[:val_count]
+            selected_test = remaining.iloc[val_count:]
+
+            # Append field IDs to each set
+            train_fids.extend(selected_train['Id'].astype(int).tolist())
+            val_fids.extend(selected_val['Id'].astype(int).tolist())
+            test_fids.extend(selected_test['Id'].astype(int).tolist())
+
+        # Convert to numpy arrays
+        train_fids = np.array(list(set(train_fids)))
+        val_fids = np.array(list(set(val_fids)))
+        test_fids = np.array(list(set(test_fids)))
+
+        logging.info(f"Number of train FIDs: {len(train_fids)}")
+        logging.info(f"Number of val FIDs: {len(val_fids)}")
+        logging.info(f"Number of test FIDs: {len(test_fids)}")
+
+    
+    if SAMPLING == "bycount":
+        # Initialize field ID lists
+        fewshot = "_"
+        train_fids = []
+        val_fids = []
+        test_fids = []
+        #snar_codes = fielddata_df['landcover_code'].unique()
+        snar_codes = fielddata_df[classcode].unique()
+        print(f"Unique landcover codes: {snar_codes}")
+
+        for sn_code in snar_codes:
+            rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
+            fids = rows_sncode['Id'].unique()
+            fids = np.array(fids)
+            np.random.shuffle(fids)
+
+            NUM_FIELDS = 5
+            if len(fids) >= NUM_FIELDS*2:
+                # Enough fields: take 10 for train, 10 for val, rest for test
+                test_fids.extend(fids[:NUM_FIELDS])
+                val_fids.extend(fids[NUM_FIELDS:NUM_FIELDS*2])
+                train_fids.extend(fids[NUM_FIELDS*2:])
+            else:
+                total = len(fids)
+                n_val = min(5, total // 2)
+                n_test = min(5, total - n_val)
+                n_train = max(0, total - n_val - n_test)
+
+                val_fids.extend(fids[:n_val])
+                test_fids.extend(fids[n_val:n_val+n_test])
+                train_fids.extend(fids[n_val+n_test:])
+
+        train_fids = np.array(train_fids)
+        val_fids = np.array(val_fids)
+        test_fids = np.array(test_fids)
+        
+        for name, fids in [("Train", train_fids), ("Val", val_fids), ("Test", test_fids)]:
+            subset = fielddata_df[fielddata_df["Id"].isin(fids)]
+            print(f"\n{name} set class distribution:")
+            print(subset[classcode].value_counts())
+
+    #print("Train field IDs:", train_fids)
+    print("Val field IDs:", val_fids)
+    logging.info(f"Train fields: {len(train_fids)}, Val fields: {len(val_fids)}, Test fields: {len(test_fids)}")
+
+    # ----------------- Create training/validation/testing split map -----------------
+    logging.info("Creating train/val/test split map for visualization...")
+    # Now we need to create the train/test/val mask using field_ids
+    # Vectorized mask creation
+    train_test_mask = np.zeros_like(field_ids, dtype=np.int8)
+    train_test_mask[np.isin(field_ids, train_fids)] = 1
+    train_test_mask[np.isin(field_ids, val_fids)] = 2
+    train_test_mask[np.isin(field_ids, test_fids)] = 3
+
+    #if MODEL != "XGBOOST":
+    #    valid_label_mask = (labels > 0)
+    #elif MODEL == "XGBOOST":
+    valid_label_mask = (labels >= 0)
+
+    # Report class distribution by pixel after split
+    y = labels  # Don't prefilter
+
+    for split_id, name in [(1, "Train"), (2, "Val"), (3, "Test")]:
+        mask = (train_test_mask == split_id)
+        y_split = y[mask]
+        print(f"{name} pixel class distribution:")
+        print(pd.Series(y_split).value_counts())
+
+
+    # ----------------- Chunk processing -----------------
+    def process_chunk(h_start, h_end, w_start, w_end, file_path):
+        logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
+        
+        # Load the chunk (new shape: H, W, bands)
+        tile_chunk = (np.load(file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]  # shape: (h, w, b)
+
+        # Reshape to (h * w, b) for ML model
+        h, w, b = tile_chunk.shape
+        s2_band_chunk = tile_chunk.reshape(-1, b)
+
+        # Load labels and field_ids
+        y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
+        fieldid_chunk = field_ids[h_start:h_end, w_start:w_end].ravel()
+
+        # Filter valid pixels
+        valid_mask = np.isin(y_chunk, list(valid_classes))
+        X_chunk = s2_band_chunk[valid_mask]
+        y_chunk = y_chunk[valid_mask]
+        fieldid_chunk = fieldid_chunk[valid_mask]
+
+        # Train/val/test split
+        train_mask = np.isin(fieldid_chunk, train_fids)
+        val_mask = np.isin(fieldid_chunk, val_fids)
+        test_mask = np.isin(fieldid_chunk, test_fids)
+
+        return (X_chunk[train_mask], y_chunk[train_mask],
+                X_chunk[val_mask], y_chunk[val_mask],
+                X_chunk[test_mask], y_chunk[test_mask])
+
+    # Parallel processing
+    chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+            for h in range(0, H, chunk_size)
+            for w in range(0, W, chunk_size)]
+    logging.info(f"Total chunks: {len(chunks)}")
+
+    results = Parallel(n_jobs=njobs)(
+        delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
+        for h_start, h_end, w_start, w_end in chunks
+    )
+
+    feature_dim = None
+    
+    for res in results:
+        if res[0].size > 0:
+            feature_dim = res[0].shape[1]  # number of columns = feature dim
+            break
+
+    if feature_dim is None:
+        raise ValueError("No training data found to infer feature dimension!")
+    logging.info(f"Feature dimension: {feature_dim}")
+
+    # Combine results
+    # X_train = np.vstack([res[0] for res in results if res[0].size > 0])
+    # y_train = np.hstack([res[1] for res in results if res[1].size > 0])
+    # X_val = np.vstack([res[2] for res in results if res[2].size > 0])
+    # y_val = np.hstack([res[3] for res in results if res[3].size > 0])
+    # X_test = np.vstack([res[4] for res in results if res[4].size > 0])
+    # y_test = np.hstack([res[5] for res in results if res[5].size > 0])
+
+        
+    # feature_dim inferred previously
+    X_train = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
+    y_train = safe_hstack([res[1] for res in results], empty_shape=(0,))
+
+    X_val = safe_vstack([res[2] for res in results], empty_shape=(0, feature_dim))
+    y_val = safe_hstack([res[3] for res in results], empty_shape=(0,))
+
+    X_test = safe_vstack([res[4] for res in results], empty_shape=(0, feature_dim))
+    y_test = safe_hstack([res[5] for res in results], empty_shape=(0,))
+
+
+    # if MODEL != "XGBOOST":
+    #     # Remove class 0 (background) from training data
+    #     logging.info("Removing class 0 (background) from training data...")
+    #     indices_to_remove = np.where(y_train == 0)[0]
+    #     y_train = np.delete(y_train, indices_to_remove, axis=0)
+    #     X_train = np.delete(X_train, indices_to_remove, axis=0)
+
+    logging.info(f"Unique y training: {np.unique(y_train)}")
+    logging.info(f"Unique y val: {np.unique(y_val)}")
+    logging.info(f"Unique y test: {np.unique(y_test)}")
+
+    logging.info(f"Data split summary:")
+    logging.info(f"  Train set: {X_train.shape[0]} samples")
+    logging.info(f"  Validation set: {X_val.shape[0]} samples")
+    logging.info(f"  Test set: {X_test.shape[0]} samples")
+
+    # Print data shapes
+    logging.info(f"X_train shape: {X_train.shape}")
+    input_size = X_train.shape[1]
+    logging.info(f"Input feature dimension: {input_size}")
+    
+    
+    
+    
+    print(f"Processing year: {year}")
+    for model in ["XGBOOST", "MLP", "RandomForest"]: # , "XGBOOST"]:
+        MODEL = model
+        
+        # if MODEL in ["XGBOOST", "MLP"]:
+        #     VAL_TEST_SPLIT_RATIO = 1/4  # Validation to test set split ratio
+        # else:
+        #     VAL_TEST_SPLIT_RATIO = 1/20  # Validation to test set split ratio
+
             
         #for seed in seeds:
         for dummy in [1]:
@@ -406,303 +711,7 @@ for seed in seeds: #[2018, 2019]:
                 return np.vstack(probs) 
 
 
-            # ----------------- Data loading and preprocessing -----------------
-            logging.info(f"Training ratio: {TRAINING_RATIO}")
-            logging.info(f"Validation/Test split ratio: {VAL_TEST_SPLIT_RATIO}")
-            logging.info(f"Selected model: {MODEL}")
-            logging.info("Loading labels and field IDs...")
-
-            labels = (np.load(label_file_path).astype(np.int64)).squeeze()
             
-            field_ids = np.load(field_id_file_path).squeeze()
-            
-            if REDUCE_LABELS:
-                # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
-                logging.info("Reducing labels...")
-                # remap labels to 0 for pasture (7) and natural vegetation (8)
-                mask = np.isin(labels, [7, 8])
-                labels[mask] = 0  # Set pasture and natural vegetation to 0
-                field_ids[mask] = 0  # Set corresponding field IDs to 0
-                     
-            if MODEL == "XGBOOST":
-                labels -= 1
-            H, W = labels.shape
-            logging.info(f"Data dimensions: {H}x{W}")
-
-
-            # Select valid classes
-            logging.info("Identifying valid classes...")
-            class_counts = Counter(labels.ravel())
-            valid_classes = {cls for cls, count in class_counts.items() if count >= 2}  
-            if MODEL == "XGBOOST":
-                valid_classes.discard(-1)
-            else:
-                valid_classes.discard(0)
-            logging.info(f"Valid classes: {sorted(valid_classes)}")
-
-            # ----------------- Train/validation/test set split -----------------
-            logging.info("Splitting data into train/val/test sets...")
-            fielddata_df = pd.read_csv(updated_fielddata_path)
-            fielddata_df = fielddata_df[fielddata_df['Year'] == year]
-            
-            # Shuffle the DataFrame in-place before sampling
-            fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-            
-            area_summary = fielddata_df.groupby(classcode)['Area_ha'].sum().reset_index()
-            count_summary = fielddata_df.groupby(classcode).size().reset_index(name='count')
-
-            #area_summary.rename(columns={'area_m2': 'total_area'}, inplace=True)
-
-            if SAMPLING == "bypercentage":
-                print("Sampling by percentage of area...with VAL_TEST_SPLIT_RATIO:", VAL_TEST_SPLIT_RATIO)
-                train_fids = []
-                val_fids = []
-                test_fids = []
-
-                for _, row in area_summary.iterrows():
-                    sn_code = row[classcode]
-                    total_area = row['Area_ha']
-                    target_train_area = total_area * TRAINING_RATIO
-
-                    # Get and shuffle all fields for this class
-                    rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
-                    rows_sncode = rows_sncode.sort_values(by='Area_ha').reset_index(drop=True)  # sorted by area (smallest to largest)
-
-                    # --- TRAINING SELECTION BY AREA ---
-                    selected_fids = []
-                    selected_area_sum = 0.0
-                    for _, r2 in rows_sncode.iterrows():
-                        if selected_area_sum < target_train_area:
-                            selected_fids.append(int(r2['Id']))
-                            selected_area_sum += r2['Area_ha']
-                        else:
-                            break
-
-                    train_fids.extend(selected_fids)
-
-                    # --- REMAINING FIELDS FOR VAL/TEST ---
-                    remaining_rows = rows_sncode[~rows_sncode['Id'].isin(selected_fids)].copy()
-                    remaining_rows = remaining_rows.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle remaining
-
-                    val_count = max(1, int(len(remaining_rows) * VAL_TEST_SPLIT_RATIO))
-                    val_rows = remaining_rows.iloc[:val_count]
-                    test_rows = remaining_rows.iloc[val_count:]
-
-                    val_fids.extend(val_rows['Id'].astype(int).tolist())
-                    test_fids.extend(test_rows['Id'].astype(int).tolist())
-
-                # Remove potential duplicates just in case
-                train_fids = np.array(list(set(train_fids)))
-                val_fids = np.array(list(set(val_fids)))
-                test_fids = np.array(list(set(test_fids)))
-
-                logging.info(f"Number of train FIDs: {len(train_fids)}")
-                logging.info(f"Number of val FIDs: {len(val_fids)}")
-                logging.info(f"Number of test FIDs: {len(test_fids)}")
-
-            
-            if SAMPLING == "bypercentage_count":
-                fewshot = ""
-                # Collect training set field IDs
-                train_fids = []
-                val_fids = []
-                test_fids = []
-
-                for _, row in count_summary.iterrows():
-                    sn_code = row[classcode]
-                    total_count = row['count']
-                    target_train_count = int(total_count * TRAINING_RATIO)
-
-                    # Filter rows for this class and shuffle them
-                    rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
-                    rows_sncode = rows_sncode.sample(frac=1, random_state=42).reset_index(drop=True)  # Shuffle
-
-                    # Split into train, val, test
-                    selected_train = rows_sncode.iloc[:target_train_count]
-                    remaining = rows_sncode.iloc[target_train_count:]
-
-                    # Compute validation count
-                    val_count = max(1, int(len(remaining) * VAL_TEST_SPLIT_RATIO))
-
-                    selected_val = remaining.iloc[:val_count]
-                    selected_test = remaining.iloc[val_count:]
-
-                    # Append field IDs to each set
-                    train_fids.extend(selected_train['Id'].astype(int).tolist())
-                    val_fids.extend(selected_val['Id'].astype(int).tolist())
-                    test_fids.extend(selected_test['Id'].astype(int).tolist())
-
-                # Convert to numpy arrays
-                train_fids = np.array(list(set(train_fids)))
-                val_fids = np.array(list(set(val_fids)))
-                test_fids = np.array(list(set(test_fids)))
-
-                logging.info(f"Number of train FIDs: {len(train_fids)}")
-                logging.info(f"Number of val FIDs: {len(val_fids)}")
-                logging.info(f"Number of test FIDs: {len(test_fids)}")
-
-            
-            if SAMPLING == "bycount":
-                # Initialize field ID lists
-                fewshot = "_"
-                train_fids = []
-                val_fids = []
-                test_fids = []
-                #snar_codes = fielddata_df['landcover_code'].unique()
-                snar_codes = fielddata_df[classcode].unique()
-                print(f"Unique landcover codes: {snar_codes}")
-
-                for sn_code in snar_codes:
-                    rows_sncode = fielddata_df[fielddata_df[classcode] == sn_code]
-                    fids = rows_sncode['Id'].unique()
-                    fids = np.array(fids)
-                    np.random.shuffle(fids)
-
-                    NUM_FIELDS = 5
-                    if len(fids) >= NUM_FIELDS*2:
-                        # Enough fields: take 10 for train, 10 for val, rest for test
-                        test_fids.extend(fids[:NUM_FIELDS])
-                        val_fids.extend(fids[NUM_FIELDS:NUM_FIELDS*2])
-                        train_fids.extend(fids[NUM_FIELDS*2:])
-                    else:
-                        total = len(fids)
-                        n_val = min(5, total // 2)
-                        n_test = min(5, total - n_val)
-                        n_train = max(0, total - n_val - n_test)
-
-                        val_fids.extend(fids[:n_val])
-                        test_fids.extend(fids[n_val:n_val+n_test])
-                        train_fids.extend(fids[n_val+n_test:])
-
-                train_fids = np.array(train_fids)
-                val_fids = np.array(val_fids)
-                test_fids = np.array(test_fids)
-                
-                for name, fids in [("Train", train_fids), ("Val", val_fids), ("Test", test_fids)]:
-                    subset = fielddata_df[fielddata_df["Id"].isin(fids)]
-                    print(f"\n{name} set class distribution:")
-                    print(subset[classcode].value_counts())
-
-            #print("Train field IDs:", train_fids)
-            print("Val field IDs:", val_fids)
-            logging.info(f"Train fields: {len(train_fids)}, Val fields: {len(val_fids)}, Test fields: {len(test_fids)}")
-
-            # ----------------- Create training/validation/testing split map -----------------
-            logging.info("Creating train/val/test split map for visualization...")
-            # Now we need to create the train/test/val mask using field_ids
-            # Vectorized mask creation
-            train_test_mask = np.zeros_like(field_ids, dtype=np.int8)
-            train_test_mask[np.isin(field_ids, train_fids)] = 1
-            train_test_mask[np.isin(field_ids, val_fids)] = 2
-            train_test_mask[np.isin(field_ids, test_fids)] = 3
-
-            if MODEL != "XGBOOST":
-                valid_label_mask = (labels > 0)
-            elif MODEL == "XGBOOST":
-                valid_label_mask = (labels >= 0)
-
-            # Report class distribution by pixel after split
-            y = labels  # Don't prefilter
-
-            for split_id, name in [(1, "Train"), (2, "Val"), (3, "Test")]:
-                mask = (train_test_mask == split_id)
-                y_split = y[mask]
-                print(f"{name} pixel class distribution:")
-                print(pd.Series(y_split).value_counts())
-
-
-            # ----------------- Chunk processing -----------------
-            def process_chunk(h_start, h_end, w_start, w_end, file_path):
-                logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
-                
-                # Load the chunk (new shape: H, W, bands)
-                tile_chunk = (np.load(file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]  # shape: (h, w, b)
-
-                # Reshape to (h * w, b) for ML model
-                h, w, b = tile_chunk.shape
-                s2_band_chunk = tile_chunk.reshape(-1, b)
-
-                # Load labels and field_ids
-                y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
-                fieldid_chunk = field_ids[h_start:h_end, w_start:w_end].ravel()
-
-                # Filter valid pixels
-                valid_mask = np.isin(y_chunk, list(valid_classes))
-                X_chunk = s2_band_chunk[valid_mask]
-                y_chunk = y_chunk[valid_mask]
-                fieldid_chunk = fieldid_chunk[valid_mask]
-
-                # Train/val/test split
-                train_mask = np.isin(fieldid_chunk, train_fids)
-                val_mask = np.isin(fieldid_chunk, val_fids)
-                test_mask = np.isin(fieldid_chunk, test_fids)
-
-                return (X_chunk[train_mask], y_chunk[train_mask],
-                        X_chunk[val_mask], y_chunk[val_mask],
-                        X_chunk[test_mask], y_chunk[test_mask])
-
-            # Parallel processing
-            chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
-                    for h in range(0, H, chunk_size)
-                    for w in range(0, W, chunk_size)]
-            logging.info(f"Total chunks: {len(chunks)}")
-
-            results = Parallel(n_jobs=njobs)(
-                delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
-                for h_start, h_end, w_start, w_end in chunks
-            )
-
-            feature_dim = None
-            
-            for res in results:
-                if res[0].size > 0:
-                    feature_dim = res[0].shape[1]  # number of columns = feature dim
-                    break
-
-            if feature_dim is None:
-                raise ValueError("No training data found to infer feature dimension!")
-            logging.info(f"Feature dimension: {feature_dim}")
-
-            # Combine results
-            # X_train = np.vstack([res[0] for res in results if res[0].size > 0])
-            # y_train = np.hstack([res[1] for res in results if res[1].size > 0])
-            # X_val = np.vstack([res[2] for res in results if res[2].size > 0])
-            # y_val = np.hstack([res[3] for res in results if res[3].size > 0])
-            # X_test = np.vstack([res[4] for res in results if res[4].size > 0])
-            # y_test = np.hstack([res[5] for res in results if res[5].size > 0])
-
-                
-            # feature_dim inferred previously
-            X_train = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
-            y_train = safe_hstack([res[1] for res in results], empty_shape=(0,))
-
-            X_val = safe_vstack([res[2] for res in results], empty_shape=(0, feature_dim))
-            y_val = safe_hstack([res[3] for res in results], empty_shape=(0,))
-
-            X_test = safe_vstack([res[4] for res in results], empty_shape=(0, feature_dim))
-            y_test = safe_hstack([res[5] for res in results], empty_shape=(0,))
-
-
-            if MODEL != "XGBOOST":
-                # Remove class 0 (background) from training data
-                logging.info("Removing class 0 (background) from training data...")
-                indices_to_remove = np.where(y_train == 0)[0]
-                y_train = np.delete(y_train, indices_to_remove, axis=0)
-                X_train = np.delete(X_train, indices_to_remove, axis=0)
-
-            logging.info(f"Unique y training: {np.unique(y_train)}")
-            logging.info(f"Unique y val: {np.unique(y_val)}")
-            logging.info(f"Unique y test: {np.unique(y_test)}")
-
-            logging.info(f"Data split summary:")
-            logging.info(f"  Train set: {X_train.shape[0]} samples")
-            logging.info(f"  Validation set: {X_val.shape[0]} samples")
-            logging.info(f"  Test set: {X_test.shape[0]} samples")
-
-            # Print data shapes
-            logging.info(f"X_train shape: {X_train.shape}")
-            input_size = X_train.shape[1]
-            logging.info(f"Input feature dimension: {input_size}")
 
             # ----------------- Model training -----------------
             logging.info(f"\nTraining {MODEL}...")
@@ -935,89 +944,89 @@ for seed in seeds: #[2018, 2019]:
 
 
 
-    # ----------------- Getting accuracy metrics -----------------
-    logging.info("Generating prediction map - this may take some time...")
-    labels = (np.load(label_file_path).astype(np.int64)).squeeze()
+    # # ----------------- Getting accuracy metrics -----------------
+    # logging.info("Generating prediction map - this may take some time...")
+    # labels = (np.load(label_file_path).astype(np.int64)).squeeze()
 
-    if REDUCE_LABELS:
-        # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
-        logging.info("Reducing labels...")
-        # remap labels to 0 for pasture (7) and natural vegetation (8)
-        mask = np.isin(labels, [7, 8])
-        labels[mask] = 0  # Set pasture and natural vegetation to 0
-        field_ids[mask] = 0  # Set corresponding field IDs to 0
+    # if REDUCE_LABELS:
+    #     # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
+    #     logging.info("Reducing labels...")
+    #     # remap labels to 0 for pasture (7) and natural vegetation (8)
+    #     mask = np.isin(labels, [7, 8])
+    #     labels[mask] = 0  # Set pasture and natural vegetation to 0
+    #     field_ids[mask] = 0  # Set corresponding field IDs to 0
 
-    class_counts = Counter(labels.ravel())
-    valid_classes = {cls for cls, count in class_counts.items() if count >= 2} 
-    valid_classes.discard(0) 
-    print(f"Valid classes: {sorted(valid_classes)} for training")
+    # class_counts = Counter(labels.ravel())
+    # valid_classes = {cls for cls, count in class_counts.items() if count >= 2} 
+    # valid_classes.discard(0) 
+    # print(f"Valid classes: {sorted(valid_classes)} for training")
 
-    logging.info("Splitting data into train/val/test sets...")
-    fielddata_df = pd.read_csv(updated_fielddata_path)
-    fielddata_df = fielddata_df[fielddata_df['Year'] == year]
+    # logging.info("Splitting data into train/val/test sets...")
+    # fielddata_df = pd.read_csv(updated_fielddata_path)
+    # fielddata_df = fielddata_df[fielddata_df['Year'] == year]
 
-    # Shuffle the DataFrame in-place before sampling
-    fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+    # # Shuffle the DataFrame in-place before sampling
+    # fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
-    area_summary = fielddata_df.groupby(classcode)['Area_ha'].sum().reset_index()
-    count_summary = fielddata_df.groupby(classcode).size().reset_index(name='count')                                     
-
-
-    ids = fielddata_df["Id"].unique()
-    logging.info(f"Unique field IDs: {len(ids)}")
+    # area_summary = fielddata_df.groupby(classcode)['Area_ha'].sum().reset_index()
+    # count_summary = fielddata_df.groupby(classcode).size().reset_index(name='count')                                     
 
 
-    def process_chunk(h_start, h_end, w_start, w_end, file_path):
-        logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
+    # ids = fielddata_df["Id"].unique()
+    # logging.info(f"Unique field IDs: {len(ids)}")
+
+
+    # def process_chunk(h_start, h_end, w_start, w_end, file_path):
+    #     logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
         
-        # Load the chunk (new shape: H, W, bands)
-        tile_chunk = (np.load(file_path).transpose(1, 2, 0))[h_start:h_end, w_start:w_end, :]  # shape: (h, w, b)
+    #     # Load the chunk (new shape: H, W, bands)
+    #     tile_chunk = (np.load(file_path).transpose(1, 2, 0))[h_start:h_end, w_start:w_end, :]  # shape: (h, w, b)
 
-        # Reshape to (h * w, b) for ML model
-        h, w, b = tile_chunk.shape
-        s2_band_chunk = tile_chunk.reshape(-1, b)
+    #     # Reshape to (h * w, b) for ML model
+    #     h, w, b = tile_chunk.shape
+    #     s2_band_chunk = tile_chunk.reshape(-1, b)
 
-        # Load labels
-        y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
+    #     # Load labels
+    #     y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
 
-        # Filter valid pixels
-        valid_mask = np.isin(y_chunk, list(valid_classes))
-        X_chunk = s2_band_chunk[valid_mask]
-        y_chunk = y_chunk[valid_mask]
+    #     # Filter valid pixels
+    #     valid_mask = np.isin(y_chunk, list(valid_classes))
+    #     X_chunk = s2_band_chunk[valid_mask]
+    #     y_chunk = y_chunk[valid_mask]
 
-        return X_chunk, y_chunk
+    #     return X_chunk, y_chunk
 
-    # Parallel processing
-    chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
-            for h in range(0, H, chunk_size)
-            for w in range(0, W, chunk_size)]
-    logging.info(f"Total chunks: {len(chunks)}")
+    # # Parallel processing
+    # chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+    #         for h in range(0, H, chunk_size)
+    #         for w in range(0, W, chunk_size)]
+    # logging.info(f"Total chunks: {len(chunks)}")
 
-    results = Parallel(n_jobs=njobs)(
-        delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
-        for h_start, h_end, w_start, w_end in chunks
-    )
+    # results = Parallel(n_jobs=njobs)(
+    #     delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
+    #     for h_start, h_end, w_start, w_end in chunks
+    # )
 
-    feature_dim = None
-    for res in results:
-        if res[0].size > 0:
-            feature_dim = res[0].shape[1]
-            break
+    # feature_dim = None
+    # for res in results:
+    #     if res[0].size > 0:
+    #         feature_dim = res[0].shape[1]
+    #         break
 
-    if feature_dim is None:
-        raise ValueError("No data found to infer feature dimension!")
+    # if feature_dim is None:
+    #     raise ValueError("No data found to infer feature dimension!")
 
-    X_all = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
-    y_all = safe_hstack([res[1] for res in results], empty_shape=(0,))
+    # X_all = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
+    # y_all = safe_hstack([res[1] for res in results], empty_shape=(0,))
 
-    print(f"Unique y all: {np.unique(y_all)}")
-    print("Final dataset shape:", X_all.shape, y_all.shape)
+    # print(f"Unique y all: {np.unique(y_all)}")
+    # print("Final dataset shape:", X_all.shape, y_all.shape)
 
-    y_probs = ensemble_predict_proba(trained_models, X_all)  # shape: (N, C)
+    y_probs = ensemble_predict_proba(trained_models, X_test)  # shape: (N, C)
     y_pred = np.argmax(y_probs, axis=1)
-    y_pred += 1  # Adjust for 1-based indexing if needed
+    #y_pred += 1  # Adjust for 1-based indexing if needed
     print(f"Unique y_pred: {np.unique(y_pred)}")
-    logging.info("Classification Report (Test Set):\n" + classification_report(y_all, y_pred, digits=4))    
+    logging.info("Classification Report (Test Set):\n" + classification_report(y_test, y_pred, digits=4))    
 
     def save_classification_report(y_true, y_pred, filename="classification_report.csv"):
                 # Get classification report as a dict and convert to DataFrame (multi-row format)
@@ -1040,179 +1049,180 @@ for seed in seeds: #[2018, 2019]:
 
     class_report_filename = f'/maps/mcl66/senegal/classification_reports/senegal_tessera_classification_report_{year}_agg_{CLASSIFICATION}.csv'
 
-    save_classification_report(y_all, y_pred, class_report_filename)
-
-    # Create prediction map
-    pred_map_whole = np.zeros_like(labels)
-
-    # Optimized batch prediction for a whole chunk
-    def batch_predict_chunk(h_start, h_end, w_start, w_end, wholemap=False):
-        """Process and predict a chunk of the image more efficiently."""
-        # Create mask for valid classes in this chunk
-        chunk_labels = labels[h_start:h_end, w_start:w_end]
-        chunk_fieldids = field_ids[h_start:h_end, w_start:w_end]
-        
-        # Create empty prediction array for this chunk
-        chunk_pred = np.zeros_like(chunk_labels)
-        
-        predict_mask = None #np.ones_like(chunk_labels, dtype=bool)
-        
-        if WHOLEMAP == True:
-                        if CLASSIFICATION == "landcover":
-                            predict_mask = np.ones_like(chunk_labels, dtype=bool)
-                        elif CLASSIFICATION == "maincrop":
-                            predict_mask = agg_pred_map_mask[h_start:h_end, w_start:w_end].astype(bool)
-        
-        # If there are no pixels to predict, return early
-        if not np.any(predict_mask):
-            return h_start, h_end, w_start, w_end, chunk_pred
-        
-        # Get coordinates of pixels that need prediction
-        h_indices, w_indices = np.where(predict_mask)
-        
-        # Load data for feature extraction (only once per chunk)
-        s2_data = (np.load(bands_file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]
-        
-        # Batch size for processing within chunk
-        batch_size = 1000
-        for i in range(0, len(h_indices), batch_size):
-            batch_h = h_indices[i:i+batch_size]
-            batch_w = w_indices[i:i+batch_size]
-            
-            # Extract features for this batch of pixels
-            batch_features = []
-            for j in range(len(batch_h)):
-                h_idx, w_idx = batch_h[j], batch_w[j]
-                
-                # S2 feature extraction
-                s2_pixel = s2_data[h_idx, w_idx, :]
-                #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
-                #s2_features = s2_norm.reshape(-1)
-                features = s2_pixel
-                batch_features.append(features)
-            
-            # Convert to numpy array
-            batch_features = np.array(batch_features)
-            
-            # Batch prediction
-            batch_probs = ensemble_predict_proba(trained_models, batch_features)  # shape: (N, C)
-            batch_preds = np.argmax(batch_probs, axis=1)
-            #batch_preds = model.predict(batch_features)
-            
-            # Place predictions into chunk
-            for j in range(len(batch_h)):
-                h_idx, w_idx = batch_h[j], batch_w[j]
-                chunk_pred[h_idx, w_idx] = batch_preds[j]
-        
-        return h_start, h_end, w_start, w_end, chunk_pred
-
-    # Define chunks for parallel processing of prediction map
-    pred_chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
-                for h in range(0, H, chunk_size)
-                for w in range(0, W, chunk_size)]
-
-    # Process prediction map in parallel
-    logging.info("Processing prediction map in parallel (optimized)...")
-
-    pred_results_whole = Parallel(n_jobs=njobs)(
-        delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end, True)
-        for h_start, h_end, w_start, w_end in pred_chunks
-    )
-
-        # Combine prediction results
-    for h_start, h_end, w_start, w_end, chunk_pred in pred_results_whole:
-        pred_map_whole[h_start:h_end, w_start:w_end] = chunk_pred
-
-    # 2. Model Prediction Map
-    logging.info("Saving model prediction classification map...")
-
-    def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
-        # Load npy data, assuming shape (H, W) or (H, W, C)
-        data = npy
-        
-        if data.dtype == np.int64:
-            # Convert int64 to uint8 if necessary
-            print("Converting int64 data to uint8...")
-            data = data.astype(np.uint8)    
-            
-        if data.ndim == 2:
-            H, W = data.shape
-            C = 1
-        else:
-            H, W, C = data.shape
-
-        # Downsample if needed
-        if downsample_rate > 1:
-            new_H = H // downsample_rate
-            new_W = W // downsample_rate
-            downsampled_data = np.zeros((new_H, new_W, C), dtype=data.dtype)
-
-            for i in range(new_H):
-                for j in range(new_W):
-                    i_start = i * downsample_rate
-                    i_end = min((i + 1) * downsample_rate, H)
-                    j_start = j * downsample_rate
-                    j_end = min((j + 1) * downsample_rate, W)
-                    block = data[i_start:i_end, j_start:j_end, :] if C > 1 else data[i_start:i_end, j_start:j_end]
-                    downsampled_data[i, j] = np.mean(block, axis=(0, 1)).astype(data.dtype)
-
-            data = downsampled_data
-            H, W = new_H, new_W
-
-        # Reference geospatial info from a valid GeoTIFF
-        with rasterio.open(ref_tiff_path) as ref:
-            transform = ref.transform
-            crs = ref.crs
-            ref_meta = ref.meta.copy()
-
-            if downsample_rate > 1:
-                transform = Affine(
-                    transform.a * downsample_rate, transform.b, transform.c,
-                    transform.d, transform.e * downsample_rate, transform.f
-                )
-
-        # Update metadata
-        new_meta = ref_meta.copy()
-        new_meta.update({
-            'driver': 'GTiff',
-            'height': H,
-            'width': W,
-            'count': C,
-            'dtype': data.dtype,
-            'transform': transform,
-            'crs': crs
-        })
-
-        # Write TIFF
-        with rasterio.open(output_path, 'w', **new_meta) as dst:
-            if C == 1:
-                dst.write(data, 1)
-            else:
-                for i in range(C):
-                    dst.write(data[:, :, i], i + 1)
-
-        print(f"✅ Saved GeoTIFF to {output_path}")
-        print(f"Resolution: {10 * downsample_rate} m")
-
+    save_classification_report(y_test, y_pred, class_report_filename)
 
     if SAVE == "yes":
-        print("Saving whole map prediction classification map...")
-        plot_classification_map(
-            pred_map_whole, 
-            f"{MODEL.lower()} Classification Predictions", 
-            cmap, 
-            class_names, 
-            f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.png"
+        # Create prediction map
+        pred_map_whole = np.zeros_like(labels)
+
+        # Optimized batch prediction for a whole chunk
+        def batch_predict_chunk(h_start, h_end, w_start, w_end, wholemap=False):
+            """Process and predict a chunk of the image more efficiently."""
+            # Create mask for valid classes in this chunk
+            chunk_labels = labels[h_start:h_end, w_start:w_end]
+            chunk_fieldids = field_ids[h_start:h_end, w_start:w_end]
+            
+            # Create empty prediction array for this chunk
+            chunk_pred = np.zeros_like(chunk_labels)
+            
+            predict_mask = None #np.ones_like(chunk_labels, dtype=bool)
+            
+            if WHOLEMAP == True:
+                            if CLASSIFICATION == "landcover":
+                                predict_mask = np.ones_like(chunk_labels, dtype=bool)
+                            elif CLASSIFICATION == "maincrop":
+                                predict_mask = agg_pred_map_mask[h_start:h_end, w_start:w_end].astype(bool)
+            
+            # If there are no pixels to predict, return early
+            if not np.any(predict_mask):
+                return h_start, h_end, w_start, w_end, chunk_pred
+            
+            # Get coordinates of pixels that need prediction
+            h_indices, w_indices = np.where(predict_mask)
+            
+            # Load data for feature extraction (only once per chunk)
+            s2_data = (np.load(bands_file_path).transpose(1,2,0))[h_start:h_end, w_start:w_end, :]
+            
+            # Batch size for processing within chunk
+            batch_size = 1000
+            for i in range(0, len(h_indices), batch_size):
+                batch_h = h_indices[i:i+batch_size]
+                batch_w = w_indices[i:i+batch_size]
+                
+                # Extract features for this batch of pixels
+                batch_features = []
+                for j in range(len(batch_h)):
+                    h_idx, w_idx = batch_h[j], batch_w[j]
+                    
+                    # S2 feature extraction
+                    s2_pixel = s2_data[h_idx, w_idx, :]
+                    #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
+                    #s2_features = s2_norm.reshape(-1)
+                    features = s2_pixel
+                    batch_features.append(features)
+                
+                # Convert to numpy array
+                batch_features = np.array(batch_features)
+                
+                # Batch prediction
+                batch_probs = ensemble_predict_proba(trained_models, batch_features)  # shape: (N, C)
+                batch_preds = np.argmax(batch_probs, axis=1)
+                #batch_preds = model.predict(batch_features)
+                
+                # Place predictions into chunk
+                for j in range(len(batch_h)):
+                    h_idx, w_idx = batch_h[j], batch_w[j]
+                    chunk_pred[h_idx, w_idx] = batch_preds[j]
+            
+            return h_start, h_end, w_start, w_end, chunk_pred
+
+        # Define chunks for parallel processing of prediction map
+        pred_chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+                    for h in range(0, H, chunk_size)
+                    for w in range(0, W, chunk_size)]
+
+        # Process prediction map in parallel
+        logging.info("Processing prediction map in parallel (optimized)...")
+
+        pred_results_whole = Parallel(n_jobs=njobs)(
+            delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end, True)
+            for h_start, h_end, w_start, w_end in pred_chunks
         )
-        # Save the prediction map as a numpy file
-        np.save(f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.npy", pred_map_whole)
-        
-        # Convert the prediction map to TIFF format
-        output_path = f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.tiff"
-        ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
-        convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
+
+            # Combine prediction results
+        for h_start, h_end, w_start, w_end, chunk_pred in pred_results_whole:
+            pred_map_whole[h_start:h_end, w_start:w_end] = chunk_pred
+
+        # 2. Model Prediction Map
+        logging.info("Saving model prediction classification map...")
+
+        def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
+            # Load npy data, assuming shape (H, W) or (H, W, C)
+            data = npy
+            
+            if data.dtype == np.int64:
+                # Convert int64 to uint8 if necessary
+                print("Converting int64 data to uint8...")
+                data = data.astype(np.uint8)    
+                
+            if data.ndim == 2:
+                H, W = data.shape
+                C = 1
+            else:
+                H, W, C = data.shape
+
+            # Downsample if needed
+            if downsample_rate > 1:
+                new_H = H // downsample_rate
+                new_W = W // downsample_rate
+                downsampled_data = np.zeros((new_H, new_W, C), dtype=data.dtype)
+
+                for i in range(new_H):
+                    for j in range(new_W):
+                        i_start = i * downsample_rate
+                        i_end = min((i + 1) * downsample_rate, H)
+                        j_start = j * downsample_rate
+                        j_end = min((j + 1) * downsample_rate, W)
+                        block = data[i_start:i_end, j_start:j_end, :] if C > 1 else data[i_start:i_end, j_start:j_end]
+                        downsampled_data[i, j] = np.mean(block, axis=(0, 1)).astype(data.dtype)
+
+                data = downsampled_data
+                H, W = new_H, new_W
+
+            # Reference geospatial info from a valid GeoTIFF
+            with rasterio.open(ref_tiff_path) as ref:
+                transform = ref.transform
+                crs = ref.crs
+                ref_meta = ref.meta.copy()
+
+                if downsample_rate > 1:
+                    transform = Affine(
+                        transform.a * downsample_rate, transform.b, transform.c,
+                        transform.d, transform.e * downsample_rate, transform.f
+                    )
+
+            # Update metadata
+            new_meta = ref_meta.copy()
+            new_meta.update({
+                'driver': 'GTiff',
+                'height': H,
+                'width': W,
+                'count': C,
+                'dtype': data.dtype,
+                'transform': transform,
+                'crs': crs
+            })
+
+            # Write TIFF
+            with rasterio.open(output_path, 'w', **new_meta) as dst:
+                if C == 1:
+                    dst.write(data, 1)
+                else:
+                    for i in range(C):
+                        dst.write(data[:, :, i], i + 1)
+
+            print(f"✅ Saved GeoTIFF to {output_path}")
+            print(f"Resolution: {10 * downsample_rate} m")
 
 
-    # Generate a composite map that shows the differences between prediction and ground truth
-    logging.info("Generating prediction difference map...")
+        if SAVE == "yes":
+            print("Saving whole map prediction classification map...")
+            plot_classification_map(
+                pred_map_whole, 
+                f"{MODEL.lower()} Classification Predictions", 
+                cmap, 
+                class_names, 
+                f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.png"
+            )
+            # Save the prediction map as a numpy file
+            np.save(f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.npy", pred_map_whole)
+            
+            # Convert the prediction map to TIFF format
+            output_path = f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_15agg.tiff"
+            ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
+            convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
+
+
+        # Generate a composite map that shows the differences between prediction and ground truth
+        logging.info("Generating prediction difference map...")
 

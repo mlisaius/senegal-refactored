@@ -52,7 +52,7 @@ from rasterio.transform import Affine
 year = 2018
 
 TRAINING_RATIO = 0.7
-MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
+#MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
 CLASSIFICATION = "maincrop"  # Options: "landcover", "maincrop"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available
 SAVE = "yes" # Save model prediction map, "yes" or "no"
@@ -72,10 +72,7 @@ NUM_EPOCHS = 200
 PATIENCE = 50  # Early stopping parameter
 
 
-if MODEL in ["XGBOOST", "MLP"]:
-    VAL_TEST_SPLIT_RATIO = 1/4  # Validation to test set split ratio
-else:
-    VAL_TEST_SPLIT_RATIO = 1/20  # Validation to test set split ratio
+
 
 
 # Log settings
@@ -91,8 +88,14 @@ logging.info(f"Using device: {DEVICE}")
 # Configuration parameters
 njobs = 12
 chunk_size = 1000
-bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_bands_by_doy_clipped_dec10.npy"
-mask_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_masks_by_doy_clipped_dec10.npy"
+bands_file_0 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group0_mini_chunk.npy", mmap_mode = 'r')
+bands_file_1 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group1_mini_chunk.npy", mmap_mode = 'r')
+bands_file_2 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group2_mini_chunk.npy", mmap_mode = 'r')
+bands_file_3 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group3_mini_chunk.npy", mmap_mode = 'r')
+bands_file_4 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group4_mini_chunk.npy", mmap_mode = 'r')
+bands_file_5 = np.load(f"/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group5_mini_chunk.npy", mmap_mode = 'r')
+
+#mask_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_masks_by_doy_clipped_dec10.npy"
 
 #label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped.npy"
 #label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_landcover_labels_dec10.npy"
@@ -162,6 +165,14 @@ elif CLASSIFICATION == "maincrop":
 seeds = list(range(1, 1 + NUM_SEEDS))
 
 for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
+    
+    
+    if MODEL in ["XGBOOST", "MLP"]:
+        VAL_TEST_SPLIT_RATIO = 1/4  # Validation to test set split ratio
+    else:
+        VAL_TEST_SPLIT_RATIO = 1/20  # Validation to test set split ratio
+    
+    
     for seed in seeds:       
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -577,56 +588,31 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
 
 
         # ----------------- Chunking -----------------
-        def process_chunk(h_start, h_end, w_start, w_end, file_path):
+        def process_chunk(h_start, h_end, w_start, w_end):
             logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
             
             # Load data for feature extraction (only once per chunk)
-            s2_bands = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
-            #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
-            #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
+            bands_0 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_1 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_2 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_3 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_4 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_5 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            
+            
+            bands_all = np.concatenate([bands_0, bands_1, bands_2, bands_3, bands_4, bands_5], axis=2)
 
-            # Normalize original bands
-            s2_bands = (s2_bands - S2_BAND_MEAN) / S2_BAND_STD
-
-            # Recombine normalized bands with VIs
-            #s2_data = np.concatenate([s2_bands, s2_vis], axis=-1)
-            s2_mask = (np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]).squeeze(axis=-1)
-            s2_mask = s2_mask[..., np.newaxis]
-
-            # Apply the mask (broadcasts automatically)
-            s2_bands = s2_bands * s2_mask
-            time_steps, h, w, s2_bands_total = s2_bands.shape
-            s2_band_chunk = s2_bands.transpose(1, 2, 0, 3).reshape(-1, time_steps * s2_bands_total)  # (h*w, time_steps * bands)
+                    
+            h, w, s2_bands_total = bands_all.shape
+            s2_band_chunk = bands_all.reshape(-1, s2_bands_total)  # (h*w, bands)
             
             sar_chunk = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
-            #sar_desc_data = np.load(sar_desc_bands_file_path)[:, h_start:h_end, w_start:w_end]
-
-            # check the data shapes of s2, sar_asc, and sar_desc
-            logging.info(f"S2 data shape: {s2_bands.shape}")
-            #logging.info(f"SAR Ascending data shape: {sar_asc_data.shape}")
-            #logging.info(f"SAR Descending data shape: {sar_desc_data.shape}")
             
-            #sar_chunk = np.concatenate((sar_asc_data, sar_desc_data), axis=0)
-
-            #valid_time_mask = np.any(sar_chunk != 0, axis=(1, 2, 3))  # keep time steps with any non-zero pixel
-
-            # Apply mask to both
-            #sar_chunk = sar_chunk[valid_time_mask]
-            
-            # Separate original bands and RVI
-            #sar_asc_bands = sar_chunk[..., :2]
-            #sar_asc_rvi = sar_chunk[..., 2:]
-
-            # Normalize only the original bands
             sar_chunk = (sar_chunk - S1_BAND_MEAN) / S1_BAND_STD
-
-            # Recombine
-            #sar_chunk = np.concatenate([sar_asc_bands, sar_asc_rvi], axis=-1)
 
             time_steps, h, w, bands = sar_chunk.shape
             sar_band_chunk = sar_chunk.transpose(1, 2, 0, 3).reshape(-1, time_steps * bands) # (h*w, time_steps*bands)
             # Concatenate s2 and s1
-            #print(f"shape of s2_band_chunk {s2_band_chunk.shape} and shape of sar_band_chunk {sar_band_chunk.shape}")
             X_chunk = np.concatenate((s2_band_chunk, sar_band_chunk), axis=1) # (h*w, time_steps*bands*2)
 
             
@@ -653,7 +639,7 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
         logging.info(f"Total chunks: {len(chunks)}")
 
         results = Parallel(n_jobs=njobs)(
-            delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
+            delayed(process_chunk)(h_start, h_end, w_start, w_end)
             for h_start, h_end, w_start, w_end in chunks
         )
 
@@ -701,12 +687,12 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
         y_test = safe_hstack([res[5] for res in results], empty_shape=(0,))
 
 
-        # if MODEL != "XGBOOST":
-        #     # Remove class 0 (background) from training data
-        #     logging.info("Removing class 0 (background) from training data...")
-        #     indices_to_remove = np.where(y_train == 0)[0]
-        #     y_train = np.delete(y_train, indices_to_remove, axis=0)
-        #     X_train = np.delete(X_train, indices_to_remove, axis=0)
+        if MODEL != "XGBOOST":
+            # Remove class 0 (background) from training data
+            logging.info("Removing class 0 (background) from training data...")
+            indices_to_remove = np.where(y_train == 0)[0]
+            y_train = np.delete(y_train, indices_to_remove, axis=0)
+            X_train = np.delete(X_train, indices_to_remove, axis=0)
 
         logging.info(f"Unique y training: {np.unique(y_train)}")
         logging.info(f"Unique y val: {np.unique(y_val)}")
@@ -788,7 +774,7 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                     
         elif MODEL == "MLP":
             # Get number of classes
-            num_classes = max(valid_classes) 
+            num_classes = max(valid_classes) + 1
             logging.info(f"Number of classes: {num_classes}")
             
             
@@ -805,11 +791,7 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                 
                 # Train MLP model on balanced data
                 mlp_model = train_mlp(X_train_balanced, y_train_balanced, X_val, y_val, num_classes, input_size)
-                
-            
-            
-            
-            
+                 
             # Create a wrapper class for consistency with other models
             class MLPWrapper:
                 def __init__(self, model):
@@ -869,11 +851,11 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
             df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
 
             # Save to CSV
-            df_cm.to_csv(f"/maps/mcl66/senegal/{outfolder}/senegal_raw_classification_confmatrix_{year}_{MODEL.lower()}_{CLASSIFICATION}.csv", index=True)
+            df_cm.to_csv(f"/maps/mcl66/senegal/{outfolder}/senegal_stm_classification_confmatrix_{year}_{MODEL.lower()}_{CLASSIFICATION}.csv", index=True)
         
         
         if REPORT == True:
-            class_report_filename = f'/maps/mcl66/senegal/classification_reports/senegal_raw_classification_report_{year}_{MODEL.lower()}_{CLASSIFICATION}.csv'
+            class_report_filename = f'/maps/mcl66/senegal/classification_reports/senegal_stm_classification_report_{year}_{MODEL.lower()}_{CLASSIFICATION}.csv'
             save_confusion_matrix(y_test, y_pred, class_names)
             save_classification_report(y_test, y_pred, seed, cpu_time, class_report_filename)
             print("Classification report saved!")
@@ -1018,13 +1000,6 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
             # Create empty prediction array for this chunk
             chunk_pred = np.zeros_like(chunk_labels)
             
-            # # Identify valid pixels that need prediction (non-training pixels with valid classes)
-            # valid_mask = np.isin(chunk_labels, list(valid_classes))
-            # # Get mask for test/val pixels (those not in training)
-            # non_train_mask = ~np.isin(chunk_fieldids, train_fids)
-            # # Combine masks to get pixels that need prediction
-            # predict_mask = valid_mask & non_train_mask
-            
             predict_mask = None   
             if WHOLEMAP == True:
                 if CLASSIFICATION == "landcover":
@@ -1055,19 +1030,15 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
             h_indices, w_indices = np.where(predict_mask)
             
             # Load data for feature extraction (only once per chunk)
-            s2_data = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
-            #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
-            #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
-
-            # Normalize original bands
-            s2_data = (s2_data - S2_BAND_MEAN) / S2_BAND_STD
-
-            # Recombine normalized bands with VIs
-            s2_mask = np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]
-            #s2_mask = s2_mask[..., np.newaxis]
-
-            # Apply the mask (broadcasts automatically)
-            s2_data = s2_data * s2_mask
+            bands_0 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_1 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_2 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_3 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_4 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            bands_5 = bands_file_0[h_start:h_end, w_start:w_end, :]
+            
+            bands_all = np.concatenate([bands_0, bands_1, bands_2, bands_3, bands_4, bands_5], axis=2)
+            
             
             sar_data = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
             
@@ -1086,8 +1057,7 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                     h_idx, w_idx = batch_h[j], batch_w[j]
                     
                     # S2 feature extraction
-                    s2_pixel = s2_data[:, h_idx, w_idx, :]
-                    #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
+                    s2_pixel = bands_all[h_idx, w_idx, :]
                     s2_features = s2_pixel.reshape(-1)
                     
                     # S1 feature extraction
@@ -1095,7 +1065,6 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                     sar_features = sar_pixel.reshape(-1)
                     
                     # Combine features
-                    #print(f"shape of s2_features {s2_features.shape} and shape of sar_features {sar_features.shape}")
 
                     features = np.concatenate((s2_features, sar_features))
 
@@ -1154,10 +1123,10 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                 f"{model_name} Classification Predictions", 
                 cmap, 
                 class_names, 
-                f"/home/mcl66/code/senegal_code/{outfolder}/senegal_raw_prediction_map_{year}_{CLASSIFICATION}_{model_name.lower()}_{seed}.png"
+                f"/home/mcl66/code/senegal_code/{outfolder}/senegal_stm_prediction_map_{year}_{model_name.lower()}_{seed}.png"
             )
             # Save the prediction map as a numpy file
-            np.save(f"/home/mcl66/code/senegal_code/{outfolder}/senegal_raw_prediction_map_{year}_{CLASSIFICATION}_{model_name.lower()}_{seed}.npy", pred_map)
+            np.save(f"/home/mcl66/code/senegal_code/{outfolder}/senegal_stm_prediction_map_{year}_{model_name.lower()}_{seed}.npy", pred_map)
 
 
         def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
@@ -1237,13 +1206,13 @@ for MODEL in ["RandomForest", "XGBOOST", "MLP"]:
                     f"{model_name} Classification Predictions", 
                     cmap, 
                     class_names, 
-                    f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_{model_name.lower()}_{seed}.png"
+                    f"/home/mcl66/code/senegal_code/{outfolder}/senegal_stm_prediction_map_whole_{year}_{CLASSIFICATION}_{model_name.lower()}_{seed}.png"
                 )
                 # Save the prediction map as a numpy file
-                np.save(f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_{model_name.lower()}_{seed}.npy", pred_map_whole)
+                np.save(f"/home/mcl66/code/senegal_code/{outfolder}/senegal_stm_prediction_map_whole_{year}_{CLASSIFICATION}_{model_name.lower()}_{seed}.npy", pred_map_whole)
                 
                 # Convert the prediction map to TIFF format
-                output_path = f"/home/mcl66/code/senegal_code/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_{model_name.lower()}_{seed}.tiff"
+                output_path = f"/home/mcl66/code/senegal_code/{outfolder}/senegal_stm_prediction_map_whole_{year}_{CLASSIFICATION}_{model_name.lower()}_{seed}.tiff"
                 ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
                 convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
 
