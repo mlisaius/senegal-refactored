@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # Sklearn - modeling and evaluation
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
@@ -49,7 +50,7 @@ from scipy import stats
 import rasterio
 from rasterio.transform import Affine
 
-year = 2018
+year = 2021
 
 TRAINING_RATIO = 0.7
 MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
@@ -60,7 +61,7 @@ SAMPLING = "bypercentage_count"  # "bypercentage", "bypercentage_count", "bycoun
 WHOLEMAP = True  # If True, process both the labels and the whole map at once, otherwise process on labels
 REPORT = True # If True, save classification report and confusion matrix to CSV
 AUGMENT = False  # If True, apply SMOTE to balance training data
-NUM_SEEDS = 1
+NUM_SEEDS = 2
 REMAP2021 = True  # If True, remap labels for 2021 to reduce pasture and natural vegetation to 0
 
 
@@ -123,7 +124,7 @@ S1_BAND_STD = np.array([1871.2334,1726.0670], dtype=np.float32)
 #Class names for visualization
 if CLASSIFICATION == "landcover":
     outfolder = "landcoverclassification"
-    mapping_code = "landcover_code"
+    classcode = "landcover_code"
     label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_landcover_labels.npy"
     class_names = [
         "Built-up surface", # 1,
@@ -151,7 +152,7 @@ elif CLASSIFICATION == "maincrop":
     agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_15agg.npy')
     agg_pred_map_mask = np.vectorize(lambda x: remapping.get(x, 0))(agg_pred_map)   
     
-    mapping_code = "maincrop_code"
+    classcode = "maincrop_code"
     label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_crop_labels.npy"
     class_names = [
         "Maize", # 1,
@@ -167,7 +168,14 @@ elif CLASSIFICATION == "maincrop":
 
 trained_models = []
 
-
+if REMAP2021:
+        if year == 2021:
+            REDUCE_LABELS = True  # For 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
+            remapped_labels = "_remapped"
+        else:
+            REDUCE_LABELS = False
+            remapped_labels = ""
+            
 #seeds = [1]
 #seeds = [1, 2, 3, 4, 5]  # List of seeds for reproducibility
 seeds = list(range(1, 1 + NUM_SEEDS))
@@ -185,13 +193,6 @@ for MODEL in ["RandomForest", "MLP"]: #xgboost
         else:
             VAL_TEST_SPLIT_RATIO = 1/20  # Validation to test set split ratio
 
-        if REMAP2021:
-            if year == 2021:
-                REDUCE_LABELS = True  # For 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
-                remapped_labels = "_remapped"
-            else:
-                REDUCE_LABELS = False
-                remapped_labels = ""
             
         start = time.process_time()
         # ----------------- Define MLP model -----------------
@@ -418,6 +419,14 @@ for MODEL in ["RandomForest", "MLP"]: #xgboost
             labels -= 1
         H, W = labels.shape
         logging.info(f"Data dimensions: {H}x{W}")
+        
+        if REDUCE_LABELS:
+            # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
+            logging.info("Reducing labels...")
+            # remap labels to 0 for pasture (7) and natural vegetation (8)
+            mask = np.isin(labels, [7, 8])
+            labels[mask] = 0  # Set pasture and natural vegetation to 0
+            field_ids[mask] = 0  # Set corresponding field IDs to 0
 
 
         # Select valid classes
@@ -615,7 +624,8 @@ for MODEL in ["RandomForest", "MLP"]: #xgboost
 
             # Recombine normalized bands with VIs
             #s2_data = np.concatenate([s2_bands, s2_vis], axis=-1)
-            s2_mask = (np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]).squeeze(axis=-1)
+            s2_mask = (np.load(mask_file_path)[:, h_start:h_end, w_start:w_end])#.squeeze(axis=-1)
+            s2_mask = np.squeeze(s2_mask) 
             s2_mask = s2_mask[..., np.newaxis]
 
             # Apply the mask (broadcasts automatically)
@@ -787,7 +797,23 @@ for MODEL in ["RandomForest", "MLP"]: #xgboost
                 # Train MLP model on balanced data
                 model.fit(X_train_balanced, y_train_balanced)
             
+        elif MODEL == "SVM":
+            # Use the run_svm function for SVM with grid search
+            #model = run_svm(X_train, y_train, njobs=njobs)  
+            model = SVC(
+                kernel='linear',       # or use 'rbf', 'poly', etc. depending on your data and needs
+                C=1.0,                 # Regularization parameter
+                class_weight='balanced',  # This handles class imbalance automatically
+                random_state=42,
+                probability=True       # If you need probability estimates for predictions
+            )
             
+            imputer = SimpleImputer(strategy='mean')  # or 'median', etc.
+            X_train = imputer.fit_transform(X_train)
+            #y_train = imputer.fit_transform(y_train)
+
+            model.fit(X_train, y_train)
+         
         elif MODEL == "XGBOOST":
                     # Compute balanced sample weights
                     # sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
@@ -857,6 +883,7 @@ for MODEL in ["RandomForest", "MLP"]: #xgboost
         elapsed_time = end - start
         logging.info(f"Training completed in {elapsed_time:.2f} seconds")
             
+
 
 
 def ensemble_predict_proba(models, features):
@@ -964,143 +991,143 @@ def plot_classification_map(data, title, cmap, class_names, save_path, figsize=(
 
 
 
-# ----------------- Getting accuracy metrics -----------------
-logging.info("Generating prediction map - this may take some time...")
-labels = (np.load(label_file_path).astype(np.int64)).squeeze()
+# # ----------------- Getting accuracy metrics -----------------
+# logging.info("Generating prediction map - this may take some time...")
+# labels = (np.load(label_file_path).astype(np.int64)).squeeze()
 
-if REDUCE_LABELS:
-    # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
-    logging.info("Reducing labels...")
-    # remap labels to 0 for pasture (7) and natural vegetation (8)
-    mask = np.isin(labels, [7, 8])
-    labels[mask] = 0  # Set pasture and natural vegetation to 0
-    field_ids[mask] = 0  # Set corresponding field IDs to 0
+# if REDUCE_LABELS:
+#     # for 2021, reduce labels to 0 for pasture (7) and natural vegetation (8)
+#     logging.info("Reducing labels...")
+#     # remap labels to 0 for pasture (7) and natural vegetation (8)
+#     mask = np.isin(labels, [7, 8])
+#     labels[mask] = 0  # Set pasture and natural vegetation to 0
+#     field_ids[mask] = 0  # Set corresponding field IDs to 0
 
-class_counts = Counter(labels.ravel())
-valid_classes = {cls for cls, count in class_counts.items() if count >= 2} 
-valid_classes.discard(0) 
-print(f"Valid classes: {sorted(valid_classes)} for training")
+# class_counts = Counter(labels.ravel())
+# valid_classes = {cls for cls, count in class_counts.items() if count >= 2} 
+# valid_classes.discard(0) 
+# print(f"Valid classes: {sorted(valid_classes)} for training")
 
-logging.info("Splitting data into train/val/test sets...")
-fielddata_df = pd.read_csv(updated_fielddata_path)
-fielddata_df = fielddata_df[fielddata_df['Year'] == year]
+# logging.info("Splitting data into train/val/test sets...")
+# fielddata_df = pd.read_csv(updated_fielddata_path)
+# fielddata_df = fielddata_df[fielddata_df['Year'] == year]
 
-# Shuffle the DataFrame in-place before sampling
-fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+# # Shuffle the DataFrame in-place before sampling
+# fielddata_df = fielddata_df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
-area_summary = fielddata_df.groupby(mapping_code)['Area_ha'].sum().reset_index()
-count_summary = fielddata_df.groupby(mapping_code).size().reset_index(name='count')                                     
-
-
-ids = fielddata_df["Id"].unique()
-logging.info(f"Unique field IDs: {len(ids)}")
+# area_summary = fielddata_df.groupby(classcode)['Area_ha'].sum().reset_index()
+# count_summary = fielddata_df.groupby(classcode).size().reset_index(name='count')                                     
 
 
-def process_chunk(h_start, h_end, w_start, w_end, file_path):
-    logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
+# ids = fielddata_df["Id"].unique()
+# logging.info(f"Unique field IDs: {len(ids)}")
+
+
+# def process_chunk(h_start, h_end, w_start, w_end):
+#     logging.info(f"Processing chunk: h[{h_start}:{h_end}], w[{w_start}:{w_end}]")
     
-    # Load data for feature extraction (only once per chunk)
-    s2_bands = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
-    #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
-    #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
+#     # Load data for feature extraction (only once per chunk)
+#     s2_bands = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
+#     #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
+#     #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
 
-    # Normalize original bands
-    s2_bands = (s2_bands - S2_BAND_MEAN) / S2_BAND_STD
+#     # Normalize original bands
+#     s2_bands = (s2_bands - S2_BAND_MEAN) / S2_BAND_STD
 
-    # Recombine normalized bands with VIs
-    #s2_data = np.concatenate([s2_bands, s2_vis], axis=-1)
-    s2_mask = (np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]).squeeze(axis=-1)
-    s2_mask = s2_mask[..., np.newaxis]
+#     # Recombine normalized bands with VIs
+#     #s2_data = np.concatenate([s2_bands, s2_vis], axis=-1)
+#     s2_mask = (np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]).squeeze(axis=-1)
+#     s2_mask = s2_mask[..., np.newaxis]
 
-    # Apply the mask (broadcasts automatically)
-    s2_bands = s2_bands * s2_mask
-    time_steps, h, w, s2_bands_total = s2_bands.shape
-    s2_band_chunk = s2_bands.transpose(1, 2, 0, 3).reshape(-1, time_steps * s2_bands_total)  # (h*w, time_steps * bands)
+#     # Apply the mask (broadcasts automatically)
+#     s2_bands = s2_bands * s2_mask
+#     time_steps, h, w, s2_bands_total = s2_bands.shape
+#     s2_band_chunk = s2_bands.transpose(1, 2, 0, 3).reshape(-1, time_steps * s2_bands_total)  # (h*w, time_steps * bands)
     
-    sar_chunk = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
-    #sar_desc_data = np.load(sar_desc_bands_file_path)[:, h_start:h_end, w_start:w_end]
+#     sar_chunk = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
+#     #sar_desc_data = np.load(sar_desc_bands_file_path)[:, h_start:h_end, w_start:w_end]
 
-    # check the data shapes of s2, sar_asc, and sar_desc
-    logging.info(f"S2 data shape: {s2_bands.shape}")
+#     # check the data shapes of s2, sar_asc, and sar_desc
+#     logging.info(f"S2 data shape: {s2_bands.shape}")
     
 
-    # Normalize only the original bands
-    sar_chunk = (sar_chunk - S1_BAND_MEAN) / S1_BAND_STD
+#     # Normalize only the original bands
+#     sar_chunk = (sar_chunk - S1_BAND_MEAN) / S1_BAND_STD
 
-    # Recombine
-    #sar_chunk = np.concatenate([sar_asc_bands, sar_asc_rvi], axis=-1)
+#     # Recombine
+#     #sar_chunk = np.concatenate([sar_asc_bands, sar_asc_rvi], axis=-1)
 
-    time_steps, h, w, bands = sar_chunk.shape
-    sar_band_chunk = sar_chunk.transpose(1, 2, 0, 3).reshape(-1, time_steps * bands) # (h*w, time_steps*bands)
-    # Concatenate s2 and s1
-    #print(f"shape of s2_band_chunk {s2_band_chunk.shape} and shape of sar_band_chunk {sar_band_chunk.shape}")
-    X_chunk = np.concatenate((s2_band_chunk, sar_band_chunk), axis=1) # (h*w, time_steps*bands*2)
+#     time_steps, h, w, bands = sar_chunk.shape
+#     sar_band_chunk = sar_chunk.transpose(1, 2, 0, 3).reshape(-1, time_steps * bands) # (h*w, time_steps*bands)
+#     # Concatenate s2 and s1
+#     #print(f"shape of s2_band_chunk {s2_band_chunk.shape} and shape of sar_band_chunk {sar_band_chunk.shape}")
+#     X_chunk = np.concatenate((s2_band_chunk, sar_band_chunk), axis=1) # (h*w, time_steps*bands*2)
 
     
-    y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
-    fieldid_chunk = field_ids[h_start:h_end, w_start:w_end].ravel()
+#     y_chunk = labels[h_start:h_end, w_start:w_end].ravel()
+#     fieldid_chunk = field_ids[h_start:h_end, w_start:w_end].ravel()
     
-    # Filter valid data
-    valid_mask = np.isin(y_chunk, list(valid_classes))
-    X_chunk, y_chunk, fieldid_chunk = X_chunk[valid_mask], y_chunk[valid_mask], fieldid_chunk[valid_mask]
+#     # Filter valid data
+#     valid_mask = np.isin(y_chunk, list(valid_classes))
+#     X_chunk, y_chunk, fieldid_chunk = X_chunk[valid_mask], y_chunk[valid_mask], fieldid_chunk[valid_mask]
     
-    return (X_chunk, y_chunk)
+#     return (X_chunk, y_chunk)
 
-# Define chunks for parallel processing
-chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
-        for h in range(0, H, chunk_size)
-        for w in range(0, W, chunk_size)]
-logging.info(f"Total chunks: {len(chunks)}")
+# # Define chunks for parallel processing
+# chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+#         for h in range(0, H, chunk_size)
+#         for w in range(0, W, chunk_size)]
+# logging.info(f"Total chunks: {len(chunks)}")
 
-results = Parallel(n_jobs=njobs)(
-    delayed(process_chunk)(h_start, h_end, w_start, w_end, bands_file_path)
-    for h_start, h_end, w_start, w_end in chunks
-)
+# results = Parallel(n_jobs=njobs)(
+#     delayed(process_chunk)(h_start, h_end, w_start, w_end)
+#     for h_start, h_end, w_start, w_end in chunks
+# )
 
 
-def safe_vstack(arrays, empty_shape=None):
-    filtered = [arr for arr in arrays if arr.size > 0]
-    if filtered:
-        return np.vstack(filtered)
-    else:
-        if empty_shape is not None:
-            return np.empty(empty_shape)
-        else:
-            return np.empty((0,))
+# def safe_vstack(arrays, empty_shape=None):
+#     filtered = [arr for arr in arrays if arr.size > 0]
+#     if filtered:
+#         return np.vstack(filtered)
+#     else:
+#         if empty_shape is not None:
+#             return np.empty(empty_shape)
+#         else:
+#             return np.empty((0,))
 
-def safe_hstack(arrays, empty_shape=None):
-    filtered = [arr for arr in arrays if arr.size > 0]
-    if filtered:
-        return np.hstack(filtered)
-    else:
-        if empty_shape is not None:
-            return np.empty(empty_shape, dtype=int)
-        else:
-            return np.empty((0,), dtype=int)
+# def safe_hstack(arrays, empty_shape=None):
+#     filtered = [arr for arr in arrays if arr.size > 0]
+#     if filtered:
+#         return np.hstack(filtered)
+#     else:
+#         if empty_shape is not None:
+#             return np.empty(empty_shape, dtype=int)
+#         else:
+#             return np.empty((0,), dtype=int)
         
-feature_dim = None  
+# feature_dim = None  
 
-for res in results:
-    if res[0].size > 0:
-        feature_dim = res[0].shape[1]  # number of columns = feature dim
-        break
+# for res in results:
+#     if res[0].size > 0:
+#         feature_dim = res[0].shape[1]  # number of columns = feature dim
+#         break
 
-if feature_dim is None:
-    raise ValueError("No training data found to infer feature dimension!")
-logging.info(f"Feature dimension: {feature_dim}")
+# if feature_dim is None:
+#     raise ValueError("No training data found to infer feature dimension!")
+# logging.info(f"Feature dimension: {feature_dim}")
 
 
-X_all = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
-y_all = safe_hstack([res[1] for res in results], empty_shape=(0,))
+# X_all = safe_vstack([res[0] for res in results], empty_shape=(0, feature_dim))
+# y_all = safe_hstack([res[1] for res in results], empty_shape=(0,))
 
-print(f"Unique y all: {np.unique(y_all)}")
-print("Final dataset shape:", X_all.shape, y_all.shape)
+# print(f"Unique y all: {np.unique(y_all)}")
+# print("Final dataset shape:", X_all.shape, y_all.shape)
 
-y_probs = ensemble_predict_proba(trained_models, X_all)  # shape: (N, C)
+y_probs = ensemble_predict_proba(trained_models, X_test)  # shape: (N, C)
 y_pred = np.argmax(y_probs, axis=1)
 y_pred += 1  # Adjust for 1-based indexing if needed
 print(f"Unique y_pred: {np.unique(y_pred)}")
-logging.info("Classification Report (Test Set):\n" + classification_report(y_all, y_pred, digits=4))    
+logging.info("Classification Report (Test Set):\n" + classification_report(y_test, y_pred, digits=4))    
 
 def save_classification_report(y_true, y_pred, filename="classification_report.csv"):
             # Get classification report as a dict and convert to DataFrame (multi-row format)
@@ -1121,198 +1148,226 @@ def save_classification_report(y_true, y_pred, filename="classification_report.c
             # Save the full DataFrame back to CSV
             combined_df.to_csv(filename, index=False, float_format='%.4f')
 
-class_report_filename = f'/maps/mcl66/senegal/classification_reports/senegal_raw_classification_report_{year}_agg_landcover.csv'
 
-save_classification_report(y_all, y_pred, class_report_filename)
 
-# Create prediction map
-pred_map_whole = np.zeros_like(labels)
-
-# Optimized batch prediction for a whole chunk
-def batch_predict_chunk(h_start, h_end, w_start, w_end):
-    """Process and predict a chunk of the image more efficiently."""
-    # Create mask for valid classes in this chunk
-    chunk_labels = labels[h_start:h_end, w_start:w_end]
-    chunk_fieldids = field_ids[h_start:h_end, w_start:w_end]
-    
-    # Create empty prediction array for this chunk
-    chunk_pred = np.zeros_like(chunk_labels)
-    
-    
-    predict_mask = np.ones_like(chunk_labels, dtype=bool)
-
-    # If there are no pixels to predict, return early
-    if not np.any(predict_mask):
-        return h_start, h_end, w_start, w_end, chunk_pred
-    
-    # Get coordinates of pixels that need prediction
-    h_indices, w_indices = np.where(predict_mask)
-    
-    # Load data for feature extraction (only once per chunk)
-    s2_data = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
-    #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
-    #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
-
-    # Normalize original bands
-    s2_data = (s2_data - S2_BAND_MEAN) / S2_BAND_STD
-
-    # Recombine normalized bands with VIs
-    s2_mask = np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]
-    #s2_mask = s2_mask[..., np.newaxis]
-
-    # Apply the mask (broadcasts automatically)
-    s2_data = s2_data * s2_mask
-    
-    sar_data = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
-    
-    # Normalize only the original bands
-    sar_data = (sar_data - S1_BAND_MEAN) / S1_BAND_STD
-    
-    # Batch size for processing within chunk
-    batch_size = 1000
-    for i in range(0, len(h_indices), batch_size):
-        batch_h = h_indices[i:i+batch_size]
-        batch_w = w_indices[i:i+batch_size]
-        
-        # Extract features for this batch of pixels
-        batch_features = []
-        for j in range(len(batch_h)):
-            h_idx, w_idx = batch_h[j], batch_w[j]
+def save_confusion_matrix(y_true, y_pred, class_names):
+            """Save confusion matrix to CSV."""
+            logging.info("Saving confusion matrix to CSV...")
+            # Get unique classes actually present in predictions or ground truth
+            present_classes = sorted(set(y_true) | set(y_pred))
             
-            # S2 feature extraction
-            s2_pixel = s2_data[:, h_idx, w_idx, :]
-            #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
-            s2_features = s2_pixel.reshape(-1)
+            # Adjust for 1-indexing: subtract 1 from class ID to get correct index into class_names
+            filtered_class_names = [class_names[i - 1] for i in present_classes]  # class_names is 1-indexed
             
-            # S1 feature extraction
-            sar_pixel = sar_data[:, h_idx, w_idx]
-            sar_features = sar_pixel.reshape(-1)
-            
-            # Combine features
-            #print(f"shape of s2_features {s2_features.shape} and shape of sar_features {sar_features.shape}")
+            # Compute confusion matrix
+            cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
 
-            features = np.concatenate((s2_features, sar_features))
+            # Convert to DataFrame for readability
+            df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
 
-            batch_features.append(features)
+            # Save to CSV
+            df_cm.to_csv(f"/maps/mcl66/senegal/{outfolder}/senegal_raw_classification_confmatrix_{year}_{CLASSIFICATION}.csv", index=True)
         
-        # Convert to numpy array
-        batch_features = np.array(batch_features)
-        
-        # Batch prediction
-        batch_preds = model.predict(batch_features)
-        
-        # Place predictions into chunk
-        for j in range(len(batch_h)):
-            h_idx, w_idx = batch_h[j], batch_w[j]
-            chunk_pred[h_idx, w_idx] = batch_preds[j]
-    
-    return h_start, h_end, w_start, w_end, chunk_pred
 
-# Define chunks for parallel processing of prediction map
-pred_chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
-            for h in range(0, H, chunk_size)
-            for w in range(0, W, chunk_size)]
 
-# Process prediction map in parallel
-logging.info("Processing prediction map in parallel (optimized)...")
+class_report_filename = f'/maps/mcl66/senegal/classification_reports_singlemodel/senegal_stm_classification_report_{year}_agg_landcover.csv'
 
-pred_results = Parallel(n_jobs=njobs)(
-    delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end)
-    for h_start, h_end, w_start, w_end in pred_chunks
-)
-
-# Combine prediction results
-for h_start, h_end, w_start, w_end, chunk_pred in pred_results:
-    pred_map_whole[h_start:h_end, w_start:w_end] = chunk_pred
-
-# 2. Model Prediction Map
-logging.info("Saving model prediction classification map...")
-
-def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
-    # Load npy data, assuming shape (H, W) or (H, W, C)
-    data = npy
-    
-    if data.dtype == np.int64:
-        # Convert int64 to uint8 if necessary
-        print("Converting int64 data to uint8...")
-        data = data.astype(np.uint8)    
-        
-    if data.ndim == 2:
-        H, W = data.shape
-        C = 1
-    else:
-        H, W, C = data.shape
-
-    # Downsample if needed
-    if downsample_rate > 1:
-        new_H = H // downsample_rate
-        new_W = W // downsample_rate
-        downsampled_data = np.zeros((new_H, new_W, C), dtype=data.dtype)
-
-        for i in range(new_H):
-            for j in range(new_W):
-                i_start = i * downsample_rate
-                i_end = min((i + 1) * downsample_rate, H)
-                j_start = j * downsample_rate
-                j_end = min((j + 1) * downsample_rate, W)
-                block = data[i_start:i_end, j_start:j_end, :] if C > 1 else data[i_start:i_end, j_start:j_end]
-                downsampled_data[i, j] = np.mean(block, axis=(0, 1)).astype(data.dtype)
-
-        data = downsampled_data
-        H, W = new_H, new_W
-
-    # Reference geospatial info from a valid GeoTIFF
-    with rasterio.open(ref_tiff_path) as ref:
-        transform = ref.transform
-        crs = ref.crs
-        ref_meta = ref.meta.copy()
-
-        if downsample_rate > 1:
-            transform = Affine(
-                transform.a * downsample_rate, transform.b, transform.c,
-                transform.d, transform.e * downsample_rate, transform.f
-            )
-
-    # Update metadata
-    new_meta = ref_meta.copy()
-    new_meta.update({
-        'driver': 'GTiff',
-        'height': H,
-        'width': W,
-        'count': C,
-        'dtype': data.dtype,
-        'transform': transform,
-        'crs': crs
-    })
-
-    # Write TIFF
-    with rasterio.open(output_path, 'w', **new_meta) as dst:
-        if C == 1:
-            dst.write(data, 1)
-        else:
-            for i in range(C):
-                dst.write(data[:, :, i], i + 1)
-
-    print(f"✅ Saved GeoTIFF to {output_path}")
-    print(f"Resolution: {10 * downsample_rate} m")
+save_classification_report(y_test, y_pred, class_report_filename)
+save_confusion_matrix(y_test, y_pred, class_names)
 
 
 if SAVE == "yes":
-    print("Saving whole map prediction classification map...")
-    plot_classification_map(
-        pred_map_whole, 
-        f"{MODEL.lower()} Classification Predictions", 
-        cmap, 
-        class_names, 
-        f"/maps/mcl66/senegal/landcoverclassification/senegal_raw_prediction_map_whole_{year}_15agg.png"
-    )
-    # Save the prediction map as a numpy file
-    np.save(f"/maps/mcl66/senegal/landcoverclassification/senegal_raw_prediction_map_whole_{year}_15agg.npy", pred_map_whole)
-    
-    # Convert the prediction map to TIFF format
-    output_path = f"/maps/mcl66/senegal/landcoverclassification/senegal_raw_prediction_map_whole_{year}_15agg.tiff"
-    ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
-    convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
+        # Create prediction map
+        pred_map_whole = np.zeros_like(labels)
+
+        # Optimized batch prediction for a whole chunk
+        def batch_predict_chunk(h_start, h_end, w_start, w_end):
+            """Process and predict a chunk of the image more efficiently."""
+            # Create mask for valid classes in this chunk
+            chunk_labels = labels[h_start:h_end, w_start:w_end]
+            chunk_fieldids = field_ids[h_start:h_end, w_start:w_end]
+            
+            # Create empty prediction array for this chunk
+            chunk_pred = np.zeros_like(chunk_labels)
+            
+            
+            predict_mask = np.ones_like(chunk_labels, dtype=bool)
+
+            # If there are no pixels to predict, return early
+            if not np.any(predict_mask):
+                return h_start, h_end, w_start, w_end, chunk_pred
+            
+            # Get coordinates of pixels that need prediction
+            h_indices, w_indices = np.where(predict_mask)
+            
+            # Load data for feature extraction (only once per chunk)
+            s2_data = np.load(bands_file_path,mmap_mode = 'r')[:, h_start:h_end, w_start:w_end, :]
+            #s2_bands = s2_data[..., :10]  # First 10 bands to normalize
+            #s2_vis = s2_data[..., 10:]    # Last 4 bands are vegetation indices (NDVI, GCVI, EVI, LSWI)
+
+            # Normalize original bands
+            s2_data = (s2_data - S2_BAND_MEAN) / S2_BAND_STD
+
+            # Recombine normalized bands with VIs
+            s2_mask = np.load(mask_file_path)[:, h_start:h_end, w_start:w_end]
+            s2_mask = np.squeeze(s2_mask) 
+            s2_mask = s2_mask[..., np.newaxis]
+
+            # Apply the mask (broadcasts automatically)
+            s2_data = s2_data * s2_mask
+            
+            sar_data = np.load(sar_asc_bands_file_path)[:, h_start:h_end, w_start:w_end]
+            
+            # Normalize only the original bands
+            sar_data = (sar_data - S1_BAND_MEAN) / S1_BAND_STD
+            
+            # Batch size for processing within chunk
+            batch_size = 1000
+            for i in range(0, len(h_indices), batch_size):
+                batch_h = h_indices[i:i+batch_size]
+                batch_w = w_indices[i:i+batch_size]
+                
+                # Extract features for this batch of pixels
+                batch_features = []
+                for j in range(len(batch_h)):
+                    h_idx, w_idx = batch_h[j], batch_w[j]
+                    
+                    # S2 feature extraction
+                    s2_pixel = s2_data[:, h_idx, w_idx, :]
+                    #s2_norm = (s2_pixel - S2_BAND_MEAN) / S2_BAND_STD
+                    s2_features = s2_pixel.reshape(-1)
+                    
+                    # S1 feature extraction
+                    sar_pixel = sar_data[:, h_idx, w_idx]
+                    sar_features = sar_pixel.reshape(-1)
+                    
+                    # Combine features
+                    #print(f"shape of s2_features {s2_features.shape} and shape of sar_features {sar_features.shape}")
+
+                    features = np.concatenate((s2_features, sar_features))
+
+                    batch_features.append(features)
+                
+                # Convert to numpy array
+                batch_features = np.array(batch_features)
+                
+                # Batch prediction
+                batch_preds = model.predict(batch_features)
+                
+                # Place predictions into chunk
+                for j in range(len(batch_h)):
+                    h_idx, w_idx = batch_h[j], batch_w[j]
+                    chunk_pred[h_idx, w_idx] = batch_preds[j]
+            
+            return h_start, h_end, w_start, w_end, chunk_pred
+
+        # Define chunks for parallel processing of prediction map
+        pred_chunks = [(h, min(h+chunk_size, H), w, min(w+chunk_size, W))
+                    for h in range(0, H, chunk_size)
+                    for w in range(0, W, chunk_size)]
+
+        # Process prediction map in parallel
+        logging.info("Processing prediction map in parallel (optimized)...")
+
+        pred_results_whole = Parallel(n_jobs=njobs)(
+            delayed(batch_predict_chunk)(h_start, h_end, w_start, w_end)
+            for h_start, h_end, w_start, w_end in pred_chunks
+        )
+
+            # Combine prediction results
+        for h_start, h_end, w_start, w_end, chunk_pred in pred_results_whole:
+            pred_map_whole[h_start:h_end, w_start:w_end] = chunk_pred
+
+        # 2. Model Prediction Map
+        logging.info("Saving model prediction classification map...")
+
+        def convert_npy_to_tiff(npy, ref_tiff_path, output_path, downsample_rate=1):
+            # Load npy data, assuming shape (H, W) or (H, W, C)
+            data = npy
+            
+            if data.dtype == np.int64:
+                # Convert int64 to uint8 if necessary
+                print("Converting int64 data to uint8...")
+                data = data.astype(np.uint8)    
+                
+            if data.ndim == 2:
+                H, W = data.shape
+                C = 1
+            else:
+                H, W, C = data.shape
+
+            # Downsample if needed
+            if downsample_rate > 1:
+                new_H = H // downsample_rate
+                new_W = W // downsample_rate
+                downsampled_data = np.zeros((new_H, new_W, C), dtype=data.dtype)
+
+                for i in range(new_H):
+                    for j in range(new_W):
+                        i_start = i * downsample_rate
+                        i_end = min((i + 1) * downsample_rate, H)
+                        j_start = j * downsample_rate
+                        j_end = min((j + 1) * downsample_rate, W)
+                        block = data[i_start:i_end, j_start:j_end, :] if C > 1 else data[i_start:i_end, j_start:j_end]
+                        downsampled_data[i, j] = np.mean(block, axis=(0, 1)).astype(data.dtype)
+
+                data = downsampled_data
+                H, W = new_H, new_W
+
+            # Reference geospatial info from a valid GeoTIFF
+            with rasterio.open(ref_tiff_path) as ref:
+                transform = ref.transform
+                crs = ref.crs
+                ref_meta = ref.meta.copy()
+
+                if downsample_rate > 1:
+                    transform = Affine(
+                        transform.a * downsample_rate, transform.b, transform.c,
+                        transform.d, transform.e * downsample_rate, transform.f
+                    )
+
+            # Update metadata
+            new_meta = ref_meta.copy()
+            new_meta.update({
+                'driver': 'GTiff',
+                'height': H,
+                'width': W,
+                'count': C,
+                'dtype': data.dtype,
+                'transform': transform,
+                'crs': crs
+            })
+
+            # Write TIFF
+            with rasterio.open(output_path, 'w', **new_meta) as dst:
+                if C == 1:
+                    dst.write(data, 1)
+                else:
+                    for i in range(C):
+                        dst.write(data[:, :, i], i + 1)
+
+            print(f"✅ Saved GeoTIFF to {output_path}")
+            print(f"Resolution: {10 * downsample_rate} m")
 
 
+        if SAVE == "yes":
+            print("Saving whole map prediction classification map...")
+            plot_classification_map(
+                pred_map_whole, 
+                f"{MODEL.lower()} Classification Predictions", 
+                cmap, 
+                class_names, 
+                f"/maps/mcl66/senegal/{outfolder}/senegal_raw_prediction_map_whole_{year}{remapped_labels}_15agg.png"
+            )
+            # Save the prediction map as a numpy file
+            np.save(f"/maps/mcl66/senegal/{outfolder}/senegal_raw_prediction_map_whole_{year}{remapped_labels}_15agg.npy", pred_map_whole)
+            
+            # Convert the prediction map to TIFF format
+            output_path = f"/maps/mcl66/senegal/{outfolder}/senegal_raw_prediction_map_whole_{year}{remapped_labels}_15agg.tiff"
+            ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
+            convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
+
+
+        # Generate a composite map that shows the differences between prediction and ground truth
+        logging.info("Generating prediction difference map...")
 

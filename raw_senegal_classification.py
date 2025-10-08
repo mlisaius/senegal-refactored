@@ -49,7 +49,7 @@ from scipy import stats
 import rasterio
 from rasterio.transform import Affine
 
-year = 2018
+year = 2019
 
 TRAINING_RATIO = 0.7
 MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
@@ -95,8 +95,10 @@ label_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_rema
 field_id_file_path = f"/maps/mcl66/senegal/label_rasters/raster_{year}_clipped.npy"
 updated_fielddata_path = "/maps/mcl66/senegal/supporting/senegal_fields.csv"
 
-sar_asc_bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_ascending_by_doy_clipped.npy"
-sar_desc_bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_descending_by_doy_clipped.npy"
+sar_asc_bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_bands_by_doy_clipped.npy"
+
+#sar_asc_bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_ascending_by_doy_clipped.npy"
+#sar_desc_bands_file_path = f"/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_descending_by_doy_clipped.npy"
 
 
 # Sentinel normalization constants
