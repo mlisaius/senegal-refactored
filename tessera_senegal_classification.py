@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # Sklearn - modeling and evaluation
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
@@ -49,17 +50,17 @@ from scipy import stats
 import rasterio
 from rasterio.transform import Affine
 
-year = 2018
+year = 2021
 
 TRAINING_RATIO = 0.7
-MODELS = ["RandomForest"]  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
+MODELS = ["MLP", "XGBOOST", "SVM"]  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
 NUM_SEEDS = 20  # Number of seeds for reproducibility
 CLASSIFICATION = "landcover"  # Options: "landcover", "maincrop"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Use GPU if available
-SAVE = "yes" # Save model prediction map, "yes" or "no"
+SAVE = "no" # Save model prediction map, "yes" or "no"
 SAMPLING = "bypercentage_count"  # "bypercentage", "bypercentage_count", "bycount"  #sampling strategy 
-WHOLEMAP = True  # If True, process both the labels and the whole map at once, otherwise process on labels
-REPORT = False # If True, save classification report and confusion matrix to CSV
+WHOLEMAP = False  # If True, process both the labels and the whole map at once, otherwise process on labels
+REPORT = True # If True, save classification report and confusion matrix to CSV
 AUGMENT = False  # If True, apply SMOTE to balance training data
 REMAP2021 = True  # If True, remap labels for 2021 to reduce pasture and natural vegetation to 0
 
@@ -117,10 +118,7 @@ elif CLASSIFICATION == "maincrop":
         #6: 0   # Pasture
     }
 
-    if year == 2021:
-        agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_remapped_15agg.npy')
-    else:
-        agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year}_15agg.npy')
+    agg_pred_map = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_croplandcombo_map.npy')
     agg_pred_map_mask = np.vectorize(lambda x: remapping.get(x, 0))(agg_pred_map)   
     
     mapping_code = "maincrop_code"
@@ -689,7 +687,25 @@ for dummy in [1]: #[2018, 2019]:
                     random_state=42
                 )
                 model.fit(X_train, y_train)
+            
+            elif MODEL == "SVM":
+                # Use the run_svm function for SVM with grid search
+                #model = run_svm(X_train, y_train, njobs=njobs)  
+                model = SVC(
+                    kernel='linear',       # or use 'rbf', 'poly', etc. depending on your data and needs
+                    C=1.0,                 # Regularization parameter
+                    class_weight='balanced',  # This handles class imbalance automatically
+                    random_state=42,
+                    probability=True       # If you need probability estimates for predictions
+                )
                 
+                imputer = SimpleImputer(strategy='mean')  # or 'median', etc.
+                X_train = imputer.fit_transform(X_train)
+                #y_train = imputer.fit_transform(y_train)
+
+                model.fit(X_train, y_train)
+                
+            
             elif MODEL == "RandomForest":
                 model = RandomForestClassifier(
                     n_estimators=100,
@@ -742,7 +758,7 @@ for dummy in [1]: #[2018, 2019]:
                         
             elif MODEL == "MLP":
                 # Get number of classes
-                num_classes = max(valid_classes+1) 
+                num_classes = max(valid_classes)+1 
                 logging.info(f"Number of classes: {num_classes}")
                 
                 
@@ -831,7 +847,7 @@ for dummy in [1]: #[2018, 2019]:
             
             
             if REPORT == True:
-                class_report_filename = f'/maps/mcl66/senegal/classification_reports/senegal_tessera_classification_report_{year}{remapped_labels}_{MODEL.lower()}_{CLASSIFICATION.lower()}.csv'
+                class_report_filename = f'/maps/mcl66/senegal/classification_reports_singlemodel/senegal_tessera_classification_report_{year}{remapped_labels}_{MODEL.lower()}_{CLASSIFICATION.lower()}.csv'
                 save_confusion_matrix(y_test, y_pred, class_names)
                 save_classification_report(y_test, y_pred, seed, cpu_time, class_report_filename)
             
@@ -1170,7 +1186,7 @@ for dummy in [1]: #[2018, 2019]:
                     
                     # Convert the prediction map to TIFF format
                     output_path = f"/maps/mcl66/senegal/{outfolder}/senegal_tessera_prediction_map_whole_{year}{remapped_labels}_{model_name.lower()}_{seed}.tiff"
-                    ref_tiff_path = f"/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
+                    ref_tiff_path = f"/maps/mcl66/senegal/representations_deprecated/2018_representation_map_10m_utm28n_scales_clipped.tiff"
                     convert_npy_to_tiff(pred_map_whole, ref_tiff_path, output_path, downsample_rate=1)
 
 

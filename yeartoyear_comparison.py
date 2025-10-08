@@ -2,11 +2,11 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine   
 
-data = "stm"  # Options: "raw", "tessera", "same", "stm"
+data = "raw"  # Options: "raw", "tessera", "same", "stm"
 SAVE = False  # Save the change map, True or False
 
-year1 = 2018
-year2 = 2019
+year1 = 2019
+year2 = 2021
 
 #model = 'randomforest'
 #year1_pred = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_tessera_prediction_map_whole_{year1}_{model}_1.npy')
@@ -26,7 +26,7 @@ if data == "same":
 else: 
     year1_pred = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_{data}_prediction_map_whole_{year1}_15agg.npy')
     if year2 == 2021:
-        year2_pred = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_{data}_prediction_map_whole_{year2}_remapped_15agg.npy')
+        year2_pred = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_{data}_prediction_map_whole_{year2}_remapped_15agg.npy')#-1
     else:
         year2_pred = np.load(f'/maps/mcl66/senegal/landcoverclassification/senegal_{data}_prediction_map_whole_{year2}_15agg.npy')
 

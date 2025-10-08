@@ -50,7 +50,7 @@ from scipy import stats
 import rasterio
 from rasterio.transform import Affine
 
-year = 2018
+year = 2021
 
 TRAINING_RATIO = 0.7
 #MODEL = "RandomForest"  # Options: "LogisticRegression", "RandomForest", or "MLP", "XGBOOST", "SVM"
@@ -413,6 +413,7 @@ for seed in seeds: #[2018, 2019]:
             logging.info("Loading labels and field IDs...")
 
             labels = (np.load(label_file_path).astype(np.int64)).squeeze()
+            print(label_file_path)
             
             field_ids = np.load(field_id_file_path).squeeze()
             
@@ -681,6 +682,10 @@ for seed in seeds: #[2018, 2019]:
 
             X_test = safe_vstack([res[4] for res in results], empty_shape=(0, feature_dim))
             y_test = safe_hstack([res[5] for res in results], empty_shape=(0,))
+            
+            print(f"Unique y training: {np.unique(y_train)}")
+            print(f"Unique y val: {np.unique(y_val)}")
+            print(f"Unique y test: {np.unique(y_test)}")
 
 
             if MODEL != "XGBOOST":
