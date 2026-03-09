@@ -1,0 +1,86 @@
+approach: "tessera"        # raw | tessera | stm | alphaearth | specmat
+classification: "landcover"  # landcover | maincrop
+year: 2021
+
+multiyear:
+  enabled: false
+  train_year: 2018
+  test_year: 2021
+
+models: ["RandomForest"]
+num_seeds: 10
+
+training:
+  ratio: 0.7
+  sampling: "bypercentage_count"   # bypercentage | bypercentage_count | bycount
+  augment: false
+
+mlp:
+  batch_size: 1024
+  learning_rate: 0.005
+  num_epochs: 200
+  patience: 50
+  hidden_sizes: [2048, 1024, 512]
+  dropout_rate: 0.4
+  focal_loss:
+    alpha: 1
+    gamma: 2
+
+aggregation:
+  enabled: true
+  num_runs: 10
+
+wholemap: false
+save_maps: false
+save_report: true
+save_confmat: true
+remap_2021_labels: true
+
+njobs: 12
+chunk_size: 1000
+
+paths:
+  data_root: "/maps/mcl66/senegal"
+  output_root: "/maps/mcl66/senegal"
+
+  # Reference GeoTIFF for coordinate metadata
+  ref_tiff: "/maps/mcl66/senegal/representations/2018_representation_map_10m_utm28n_scales_clipped.tiff"
+
+  # Field raster and field metadata CSV
+  field_ids: "/maps/mcl66/senegal/label_rasters/raster_{year}_clipped.npy"
+  fielddata: "/maps/mcl66/senegal/supporting/senegal_fields.csv"
+
+  # Label rasters (resolved at runtime based on classification type)
+  label_landcover: "/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_landcover_labels.npy"
+  label_maincrop: "/maps/mcl66/senegal/label_rasters/raster_{year}_clipped_remapped_crop_labels.npy"
+
+  # Raw approach
+  s2_bands: "/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_bands_by_doy_clipped.npy"
+  s2_mask: "/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_masks_by_doy_clipped.npy"
+  sar_bands: "/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_sar_bands_by_doy_clipped.npy"
+
+  # Tessera approach
+  tessera_reps: "/maps/mcl66/senegal/representations/{year}_representation_map_10m_utm28n_128bands_clipped.npy"
+  tessera_scales: "/maps/mcl66/senegal/representations/{year}_representation_map_10m_utm28n_scales_clipped.npy"
+
+  # STM approach (6 group chunks)
+  stm_group0: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group0_chunk.npy"
+  stm_group1: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group1_chunk.npy"
+  stm_group2: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group2_chunk.npy"
+  stm_group3: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group3_chunk.npy"
+  stm_group4: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group4_chunk.npy"
+  stm_group5: "/maps/mcl66/senegal/d-pixel/stms/stms_{year}_group5_chunk.npy"
+
+  # AlphaEarth approach
+  alphaearth_efm: "/maps/mcl66/senegal/alphaearth/efm_{year}_10m_clipped.npy"
+
+  # Specmat approach
+  specmat_ndvi: "/maps/mcl66/senegal/d-pixel/merged_clipped/{year}_merged_ndvi_monthly_clipped.npy"
+
+  # Output directories
+  landcoverclassification: "/maps/mcl66/senegal/landcoverclassification"
+  cropclassification: "/maps/mcl66/senegal/cropclassification"
+  classification_reports: "/maps/mcl66/senegal/classification_reports"
+
+  # Cropland combo mask (used when classification == maincrop)
+  cropland_combo_mask: "/maps/mcl66/senegal/landcoverclassification/senegal_tessera_croplandcombo_map.npy"
