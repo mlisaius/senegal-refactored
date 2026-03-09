@@ -208,8 +208,8 @@ Loads a `(T, H, W)` monthly NDVI array and transposes to `(H×W, T)`. Feature ve
 | 3 | Sorghum |
 | 4 | Millet |
 | 5 | Groundnut |
-| 6 | Sesame |
-| 7 | Cotton |
+| 6 | Other |
+| 7 | Fallow/Bare |
 
 > **Note**: The maincrop pipeline requires a pre-computed cropland combo mask (`paths.cropland_combo_mask`). Only pixels inside this mask are classified — see [Analysis Scripts](#analysis-scripts) for how to generate it.
 
